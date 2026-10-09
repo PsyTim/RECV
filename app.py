@@ -3,6 +3,8 @@ import json
 import base64
 import threading
 import uuid
+import random
+import sqlite3
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,6 +22,10 @@ ENV_TOKEN = os.environ.get("LOGS_TOKEN", "").strip()
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "").strip()
 
+# --- персистентность логов (SQLite) ---
+DB_FILE = BASE_DIR / "logs.db"
+LOGS_FILE = BASE_DIR / "logs.json"          # старый формат, для миграции
+
 # --- http-прокси ---
 PROXY_USER = os.environ.get("PROXY_USER", "").strip()
 PROXY_PASS = os.environ.get("PROXY_PASS", "").strip()
@@ -30,17 +36,238 @@ PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "30"))
 
 PROXY_ENABLED = bool(PROXY_USER and PROXY_PASS and UPSTREAM_PROXY_URL)
 
+# --- телефон и AID-счётчик ---
+COUNTER_FILE = BASE_DIR / "counter.txt"
+AID_UNIT_SECONDS = float(os.environ.get("AID_UNIT_SECONDS", "180"))
+AID_RAND_MIN = int(os.environ.get("AID_RAND_MIN", "3"))
+AID_RAND_MAX = int(os.environ.get("AID_RAND_MAX", "7"))
+
+current_phone = None
+phone_lock = threading.Lock()
+aid_lock = threading.Lock()
+
 # --- лимиты ---
 MAX_LOGS = int(os.environ.get("MAX_LOGS", "1000"))
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "10240"))
-# Отдельный лимит для тела ответа (может быть больше)
 MAX_RESP_BYTES = int(os.environ.get("MAX_RESP_BYTES", "10240"))
-
-logs = []
-lock = threading.Lock()
 
 ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
 RENDER_API = "https://api.render.com/v1"
+
+
+# ==================== SQLITE ====================
+
+db_lock = threading.Lock()
+_db_conn = None
+
+
+def init_db():
+    global _db_conn
+    _db_conn = sqlite3.connect(str(DB_FILE), check_same_thread=False)
+    _db_conn.row_factory = sqlite3.Row
+    _db_conn.execute("PRAGMA journal_mode=WAL")
+    _db_conn.execute("PRAGMA synchronous=NORMAL")
+    _db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            id TEXT NOT NULL UNIQUE,
+            timestamp TEXT NOT NULL,
+            remote_addr TEXT,
+            method TEXT,
+            path TEXT,
+            full_url TEXT,
+            target_url TEXT,
+            proxy INTEGER DEFAULT 0,
+            phone_request INTEGER DEFAULT 0,
+            phone_served INTEGER DEFAULT 0,
+            query_params TEXT,
+            headers TEXT,
+            cookies TEXT,
+            content_type TEXT,
+            body_text TEXT,
+            body_json TEXT,
+            body_encoding TEXT,
+            body_size INTEGER,
+            body_truncated INTEGER DEFAULT 0,
+            form TEXT,
+            resp_status INTEGER,
+            resp_reason TEXT,
+            resp_headers TEXT,
+            resp_body_text TEXT,
+            resp_body_json TEXT,
+            resp_body_encoding TEXT,
+            resp_body_size INTEGER,
+            resp_body_truncated INTEGER DEFAULT 0,
+            resp_content_type TEXT,
+            error TEXT
+        )
+    """)
+    _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)")
+    _db_conn.commit()
+
+
+def _to_json(x):
+    if x is None:
+        return None
+    try:
+        return json.dumps(x, ensure_ascii=False)
+    except Exception:
+        return None
+
+
+def _from_json(s):
+    if s is None or s == "":
+        return None
+    try:
+        return json.loads(s)
+    except Exception:
+        return None
+
+
+def _insert_log_sql(record):
+    _db_conn.execute("""
+        INSERT OR REPLACE INTO logs (
+            id, timestamp, remote_addr, method, path, full_url, target_url,
+            proxy, phone_request, phone_served,
+            query_params, headers, cookies, content_type,
+            body_text, body_json, body_encoding, body_size, body_truncated, form,
+            resp_status, resp_reason, resp_headers,
+            resp_body_text, resp_body_json, resp_body_encoding,
+            resp_body_size, resp_body_truncated, resp_content_type, error
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        record.get("id"),
+        record.get("timestamp"),
+        record.get("remote_addr"),
+        record.get("method"),
+        record.get("path"),
+        record.get("full_url"),
+        record.get("target_url"),
+        1 if record.get("proxy") else 0,
+        1 if record.get("phone_request") else 0,
+        1 if record.get("phone_served") else 0,
+        _to_json(record.get("query_params")),
+        _to_json(record.get("headers")),
+        _to_json(record.get("cookies")),
+        record.get("content_type"),
+        record.get("body_text"),
+        _to_json(record.get("body_json")),
+        record.get("body_encoding"),
+        record.get("body_size"),
+        1 if record.get("body_truncated") else 0,
+        _to_json(record.get("form")),
+        record.get("resp_status"),
+        record.get("resp_reason"),
+        _to_json(record.get("resp_headers")),
+        record.get("resp_body_text"),
+        _to_json(record.get("resp_body_json")),
+        record.get("resp_body_encoding"),
+        record.get("resp_body_size"),
+        1 if record.get("resp_body_truncated") else 0,
+        record.get("resp_content_type"),
+        record.get("error"),
+    ))
+
+
+def _row_to_dict(row):
+    return {
+        "id": row["id"],
+        "timestamp": row["timestamp"],
+        "remote_addr": row["remote_addr"],
+        "method": row["method"],
+        "path": row["path"],
+        "full_url": row["full_url"],
+        "target_url": row["target_url"],
+        "proxy": bool(row["proxy"]),
+        "phone_request": bool(row["phone_request"]),
+        "phone_served": bool(row["phone_served"]),
+        "query_params": _from_json(row["query_params"]) or {},
+        "headers": _from_json(row["headers"]) or {},
+        "cookies": _from_json(row["cookies"]) or {},
+        "content_type": row["content_type"],
+        "body_text": row["body_text"],
+        "body_json": _from_json(row["body_json"]),
+        "body_encoding": row["body_encoding"],
+        "body_size": row["body_size"],
+        "body_truncated": bool(row["body_truncated"]),
+        "form": _from_json(row["form"]) or {},
+        "resp_status": row["resp_status"],
+        "resp_reason": row["resp_reason"],
+        "resp_headers": _from_json(row["resp_headers"]),
+        "resp_body_text": row["resp_body_text"],
+        "resp_body_json": _from_json(row["resp_body_json"]),
+        "resp_body_encoding": row["resp_body_encoding"],
+        "resp_body_size": row["resp_body_size"],
+        "resp_body_truncated": bool(row["resp_body_truncated"]),
+        "resp_content_type": row["resp_content_type"],
+        "error": row["error"],
+    }
+
+
+def db_insert_log(record):
+    with db_lock:
+        _insert_log_sql(record)
+        _db_conn.execute("""
+            DELETE FROM logs WHERE seq NOT IN (
+                SELECT seq FROM logs ORDER BY seq DESC LIMIT ?
+            )
+        """, (MAX_LOGS,))
+        _db_conn.commit()
+
+
+def db_get_logs():
+    with db_lock:
+        cur = _db_conn.execute("SELECT * FROM logs ORDER BY seq ASC")
+        return [_row_to_dict(r) for r in cur.fetchall()]
+
+
+def db_clear_logs():
+    with db_lock:
+        _db_conn.execute("DELETE FROM logs")
+        _db_conn.commit()
+
+
+def db_delete_log(log_id):
+    with db_lock:
+        cur = _db_conn.execute("DELETE FROM logs WHERE id = ?", (log_id,))
+        _db_conn.commit()
+        return cur.rowcount > 0
+
+
+def db_delete_batch(ids):
+    if not ids:
+        return 0
+    with db_lock:
+        placeholders = ",".join("?" * len(ids))
+        cur = _db_conn.execute(
+            f"DELETE FROM logs WHERE id IN ({placeholders})",
+            list(ids),
+        )
+        _db_conn.commit()
+        return cur.rowcount
+
+
+def migrate_from_json():
+    if not LOGS_FILE.exists():
+        return
+    try:
+        cur = _db_conn.execute("SELECT COUNT(*) FROM logs")
+        if cur.fetchone()[0] > 0:
+            return
+        data = json.loads(LOGS_FILE.read_text(encoding='utf-8'))
+        if not isinstance(data, list):
+            return
+        with db_lock:
+            for record in data:
+                if isinstance(record, dict) and record.get("id"):
+                    _insert_log_sql(record)
+            _db_conn.commit()
+        try:
+            LOGS_FILE.rename(LOGS_FILE.with_suffix('.json.migrated'))
+        except Exception:
+            pass
+    except Exception:
+        pass
 
 
 # ==================== ТОКЕН ====================
@@ -103,6 +330,58 @@ def token_is_set():
 
 def render_api_available():
     return bool(RENDER_API_KEY and RENDER_SERVICE_ID)
+
+
+# ==================== AID-СЧЁТЧИК ====================
+
+def _read_counter_file():
+    try:
+        if COUNTER_FILE.exists():
+            text = COUNTER_FILE.read_text(encoding='utf-8').strip()
+            if ':' in text:
+                ts_str, aid_str = text.split(':', 1)
+                return int(ts_str.strip()), int(aid_str.strip())
+    except Exception:
+        pass
+    return None, None
+
+
+def _write_counter_file(ts, aid):
+    try:
+        COUNTER_FILE.write_text(f"{int(ts)}:{int(aid)}", encoding='utf-8')
+    except Exception:
+        pass
+
+
+def _new_aid_counter():
+    ts = int(datetime.now(timezone.utc).timestamp())
+    aid = random.randint(100000, 999999)
+    _write_counter_file(ts, aid)
+    return ts, aid
+
+
+def load_aid_counter():
+    ts, aid = _read_counter_file()
+    if ts is None or aid is None:
+        return _new_aid_counter()
+    return ts, aid
+
+
+def next_aid():
+    """
+    INCR = 1 + int((Now - timestamp) / 180 * Rand(3..7))
+    new_aid = aid + INCR
+    После выдачи: в файл пишем (now, new_aid)
+    """
+    with aid_lock:
+        ts, aid = load_aid_counter()
+        now = int(datetime.now(timezone.utc).timestamp())
+        delta = max(0, now - ts)
+        multiplier = random.randint(AID_RAND_MIN, AID_RAND_MAX)
+        incr = 1 + int((delta / AID_UNIT_SECONDS) * multiplier)
+        new_aid = aid + incr
+        _write_counter_file(now, new_aid)
+        return new_aid
 
 
 # ==================== ПРОКСИ: АВТОРИЗАЦИЯ ====================
@@ -180,17 +459,18 @@ def read_body():
         body_text = base64.b64encode(raw).decode('ascii')
         body_encoding = 'base64'
 
-    if request.is_json:
-        try:
-            body_json = json.loads(body_text)
-        except Exception:
-            body_json = None
+    if body_text:
+        stripped = body_text.lstrip()
+        if stripped.startswith('{') or stripped.startswith('['):
+            try:
+                body_json = json.loads(body_text)
+            except Exception:
+                body_json = None
 
     return body_text, body_json, truncated, body_encoding, original_size
 
 
 def decode_response_body(raw):
-    """Декодирует тело ответа. Возвращает (text, encoding, json_obj, truncated, size)."""
     if not raw:
         return None, None, None, False, 0
 
@@ -207,7 +487,6 @@ def decode_response_body(raw):
     try:
         text = raw.decode('utf-8')
         encoding = 'utf-8'
-        # Попробуем распарсить как JSON
         stripped = text.lstrip()
         if stripped.startswith('{') or stripped.startswith('['):
             try:
@@ -222,10 +501,7 @@ def decode_response_body(raw):
 
 
 def append_log(record):
-    with lock:
-        logs.append(record)
-        if len(logs) > MAX_LOGS:
-            logs.pop(0)
+    db_insert_log(record)
 
 
 # ==================== UI ====================
@@ -323,6 +599,45 @@ def setup_render_token():
     })
 
 
+# ==================== ТЕЛЕФОН ====================
+
+def get_current_phone():
+    with phone_lock:
+        return current_phone
+
+
+def set_current_phone(phone):
+    global current_phone
+    with phone_lock:
+        current_phone = phone or None
+
+
+def consume_phone():
+    global current_phone
+    with phone_lock:
+        phone = current_phone
+        current_phone = None
+    return phone
+
+
+@app.route('/_phone', methods=['GET', 'POST', 'DELETE'])
+def phone_endpoint():
+    if not check_token():
+        return jsonify({"error": "unauthorized"}), 401
+
+    if request.method == 'GET':
+        return jsonify({"phone": get_current_phone()})
+
+    if request.method == 'POST':
+        data = request.get_json(silent=True) or {}
+        new_phone = (data.get("phone") or "").strip()
+        set_current_phone(new_phone)
+        return jsonify({"status": "ok", "phone": get_current_phone()})
+
+    set_current_phone(None)
+    return jsonify({"status": "cleared"})
+
+
 # ==================== СЛУЖЕБНЫЕ ====================
 
 @app.route('/health', methods=['GET'])
@@ -334,8 +649,7 @@ def health():
 def view_logs():
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
-    with lock:
-        data = list(logs)
+    data = db_get_logs()
     return jsonify({"count": len(data), "logs": data})
 
 
@@ -343,8 +657,7 @@ def view_logs():
 def clear_logs():
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
-    with lock:
-        logs.clear()
+    db_clear_logs()
     return jsonify({"status": "cleared"})
 
 
@@ -356,27 +669,20 @@ def delete_batch():
     ids = data.get("ids")
     if not isinstance(ids, list):
         return jsonify({"error": "ids must be an array"}), 400
-    ids_set = set(ids)
-    with lock:
-        before = len(logs)
-        logs[:] = [r for r in logs if r.get("id") not in ids_set]
-        removed = before - len(logs)
-    return jsonify({"status": "deleted", "removed": removed, "requested": len(ids_set)})
+    removed = db_delete_batch(ids)
+    return jsonify({"status": "deleted", "removed": removed, "requested": len(set(ids))})
 
 
 @app.route('/_logs/<log_id>', methods=['DELETE'])
 def delete_log(log_id):
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
-    with lock:
-        for i, r in enumerate(logs):
-            if r.get("id") == log_id:
-                logs.pop(i)
-                return jsonify({"status": "deleted", "id": log_id})
+    if db_delete_log(log_id):
+        return jsonify({"status": "deleted", "id": log_id})
     return jsonify({"error": "not found"}), 404
 
 
-# ==================== ПРОКСИ-ОБРАБОТЧИК ====================
+# ==================== ПРОКСИ ====================
 
 def handle_proxy():
     if not check_proxy_auth():
@@ -390,12 +696,10 @@ def handle_proxy():
     if not target_url:
         return Response("Bad Request: cannot determine target host", status=400)
 
-    # --- читаем запрос ---
     body_text, body_json, truncated, body_encoding, body_size = read_body()
     cookies = {k: v for k, v in request.cookies.items()}
     req_headers = dict(request.headers)
 
-    # --- пробрасываем на upstream-прокси ---
     forward_headers = {
         k: v for k, v in request.headers.items()
         if k.lower() not in (
@@ -428,7 +732,6 @@ def handle_proxy():
     except requests.RequestException as e:
         error = f"upstream error: {e}"
 
-    # --- логируем ---
     record = {
         "id": uuid.uuid4().hex[:12],
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -488,13 +791,72 @@ def handle_proxy():
     return Response(resp.content, resp.status_code, resp_headers)
 
 
-# ==================== ОБЫЧНЫЙ ЛОГГЕР ====================
+# ==================== ОБЫЧНЫЙ ЛОГГЕР (+ getNumber) ====================
+
+def is_phone_getter_request(body_json):
+    if not isinstance(body_json, dict):
+        return False
+    actions = body_json.get("action")
+    if actions is None:
+        return False
+    if isinstance(actions, str):
+        actions = [actions]
+    if not isinstance(actions, list):
+        return False
+    return "getNumber" in actions
+
 
 def handle_log(path):
     body_text, body_json, truncated, body_encoding, body_size = read_body()
     cookies = {k: v for k, v in request.cookies.items()}
 
-    # Формируем ответ (тот JSON, что уйдёт клиенту)
+    if is_phone_getter_request(body_json):
+        phone = consume_phone()
+        if phone:
+            aid = next_aid()
+            resp_text = f"{aid}:{phone}"
+            phone_served = True
+        else:
+            resp_text = "-"
+            phone_served = False
+
+        resp_body = resp_text.encode('utf-8')
+        r_text, r_enc, r_json, r_trunc, r_size = decode_response_body(resp_body)
+
+        record = {
+            "id": uuid.uuid4().hex[:12],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "remote_addr": get_client_ip(),
+            "method": request.method,
+            "path": request.path,
+            "full_url": request.url,
+            "proxy": False,
+            "phone_request": True,
+            "phone_served": phone_served,
+            "query_params": request.args.to_dict(flat=False),
+            "headers": dict(request.headers),
+            "cookies": cookies,
+            "content_type": request.content_type,
+            "body_text": body_text,
+            "body_json": body_json,
+            "body_encoding": body_encoding,
+            "body_size": body_size,
+            "body_truncated": truncated,
+            "form": request.form.to_dict(flat=False) if request.form else {},
+            "resp_status": 200,
+            "resp_reason": "OK",
+            "resp_headers": {"Content-Type": "text/plain"},
+            "resp_body_text": r_text,
+            "resp_body_json": None,
+            "resp_body_encoding": r_enc,
+            "resp_body_size": r_size,
+            "resp_body_truncated": r_trunc,
+            "resp_content_type": "text/plain",
+            "error": None,
+        }
+        append_log(record)
+        return Response(resp_text, mimetype="text/plain")
+
     resp_obj = {
         "status": "logged",
         "path": request.path,
@@ -511,6 +873,8 @@ def handle_log(path):
         "path": request.path,
         "full_url": request.url,
         "proxy": False,
+        "phone_request": False,
+        "phone_served": False,
         "query_params": request.args.to_dict(flat=False),
         "headers": dict(request.headers),
         "cookies": cookies,
@@ -534,7 +898,6 @@ def handle_log(path):
     }
     append_log(record)
 
-    # id надо положить внутрь ответа
     resp_obj["id"] = record["id"]
     return jsonify(resp_obj), 200
 
@@ -547,6 +910,13 @@ def catch_all(path):
     if PROXY_ENABLED and is_proxy_request():
         return handle_proxy()
     return handle_log(path)
+
+
+# ==================== ИНИЦИАЛИЗАЦИЯ ====================
+
+init_db()
+migrate_from_json()
+load_aid_counter()
 
 
 if __name__ == '__main__':

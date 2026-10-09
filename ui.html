@@ -74,6 +74,32 @@
             background: #2563eb;
         }
 
+        .phone-btn {
+            padding: 7px 12px;
+            background: #1e293b;
+            color: #93c5fd;
+            border: 1px solid #1d4ed8;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 13px;
+            font-family: inherit;
+            font-weight: 600;
+        }
+
+        .phone-btn:hover {
+            background: #1e3a8a;
+        }
+
+        .phone-btn.has-phone {
+            background: #14532d;
+            color: #86efac;
+            border-color: #166534;
+        }
+
+        .phone-btn.has-phone:hover {
+            background: #166534;
+        }
+
         input[type=password],
         input[type=text] {
             padding: 7px 10px;
@@ -242,6 +268,10 @@
             border-left: 3px solid #ef4444;
         }
 
+        .log.phone {
+            border-left: 3px solid #22c55e;
+        }
+
         .log-head {
             display: grid;
             grid-template-columns: 100px 70px 1fr 140px 70px 36px;
@@ -323,6 +353,24 @@
             margin-right: 6px;
             letter-spacing: 0.5px;
             vertical-align: middle;
+        }
+
+        .phone-tag {
+            display: inline-block;
+            font-size: 9px;
+            padding: 2px 5px;
+            border-radius: 3px;
+            background: #14532d;
+            color: #86efac;
+            font-weight: 700;
+            margin-right: 6px;
+            letter-spacing: 0.5px;
+            vertical-align: middle;
+        }
+
+        .phone-tag.miss {
+            background: #7c2d12;
+            color: #fdba74;
         }
 
         .status-tag {
@@ -590,6 +638,9 @@
         <h1>📋 SMS Proxy Logs</h1>
         <span class="status" id="status">загрузка…</span>
         <span class="badge" id="tokenBadge">—</span>
+
+        <button class="phone-btn" id="phoneBtn" onclick="openPhoneModal()">+ Phone</button>
+
         <div class="spacer"></div>
 
         <label class="mode-toggle" title="Режим выделения">
@@ -614,6 +665,7 @@
     <div class="footer">GET /_logs · DELETE /_logs/&lt;id&gt; · POST /_logs/delete · POST /_logs/clear · клавиша R —
         обновить</div>
 
+    <!-- Модал токена -->
     <div class="modal-backdrop" id="tokenModal" style="display:none">
         <div class="modal">
             <h2>🔑 Токен доступа</h2>
@@ -622,7 +674,8 @@
             <div class="modal-section" id="sectionLocal">
                 <div class="modal-section-title">Установить локально (файл token.txt)</div>
                 <div class="hint">Токен хранится в файле рядом с app.py. Только печатные ASCII: латиница, цифры,
-                    <code>- _ . ~</code>. Минимум 8 символов.</div>
+                    <code>- _ . ~</code>. Минимум 8 символов.
+                </div>
                 <div class="gen-row">
                     <input type="text" id="tokenLocalInput" placeholder="Токен">
                     <button onclick="generateToken('tokenLocalInput')" title="Сгенерировать">🎲</button>
@@ -655,6 +708,35 @@
         </div>
     </div>
 
+    <!-- Модал телефона -->
+    <div class="modal-backdrop" id="phoneModal" style="display:none">
+        <div class="modal">
+            <h2>📞 Телефонный номер</h2>
+            <div class="modal-info">
+                Номер будет храниться в памяти сервера и выдан один раз в ответ на запрос с
+                <code>action: ["getNumber"]</code>, после чего будет стёрт.
+            </div>
+
+            <div class="modal-section">
+                <div class="modal-section-title">Установить номер</div>
+                <div class="hint">Например: <code>+79991234567</code>. Оставьте пустым, чтобы просто стереть текущий.
+                </div>
+                <div class="gen-row">
+                    <input type="text" id="phoneInput" placeholder="+7..." style="width:100%;">
+                </div>
+                <div class="modal-actions" style="margin-top:10px;">
+                    <button onclick="savePhone()" class="primary">Сохранить</button>
+                    <button class="danger" onclick="clearPhone()">Стереть</button>
+                </div>
+                <div class="hint" id="phoneProgress" style="display:none; margin-top:10px;"></div>
+            </div>
+
+            <div class="modal-actions" style="margin-top:8px;">
+                <button onclick="closePhoneModal()">Закрыть</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         const TOKEN_KEY = 'smsproxy_token';
         const SELECT_MODE_KEY = 'smsproxy_select_mode';
@@ -664,6 +746,7 @@
         const respMetaOpenIds = new Set();
         const selectedIds = new Set();
         let tokenStatus = { required: false, source: null, env_locked: false, render_api_available: false, can_set_local: false, can_delete_local: false };
+        let currentPhone = null;
 
         function isAsciiToken(t) {
             if (!t || t.length < 8) return false;
@@ -785,6 +868,87 @@
             }
         }
 
+        // ---------- ТЕЛЕФОН ----------
+        function updatePhoneButton() {
+            const btn = document.getElementById('phoneBtn');
+            if (!btn) return;
+            if (currentPhone) {
+                btn.textContent = currentPhone;
+                btn.classList.add('has-phone');
+            } else {
+                btn.textContent = '+ Phone';
+                btn.classList.remove('has-phone');
+            }
+        }
+        async function refreshPhone() {
+            try {
+                const r = await fetch('/_phone', { headers: authHeaders() });
+                if (!r.ok) return;
+                const data = await r.json();
+                currentPhone = data.phone || null;
+                updatePhoneButton();
+            } catch (e) { }
+        }
+        function openPhoneModal() {
+            const m = document.getElementById('phoneModal');
+            const inp = document.getElementById('phoneInput');
+            const prog = document.getElementById('phoneProgress');
+            if (!m) return;
+            if (inp) inp.value = currentPhone || '';
+            if (prog) { prog.style.display = 'none'; prog.textContent = ''; }
+            m.style.display = 'flex';
+            setTimeout(() => { if (inp) inp.focus(); }, 50);
+        }
+        function closePhoneModal() {
+            const m = document.getElementById('phoneModal');
+            if (m) m.style.display = 'none';
+        }
+        async function savePhone() {
+            const inp = document.getElementById('phoneInput');
+            const prog = document.getElementById('phoneProgress');
+            const t = (inp.value || '').trim();
+            if (!t) { alert('Введите номер телефона'); return; }
+            prog.style.display = 'block';
+            prog.style.color = '#fbbf24';
+            prog.textContent = '⏳ Сохраняю…';
+            const r = await fetch('/_phone', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                body: JSON.stringify({ phone: t })
+            });
+            if (r.ok) {
+                const data = await r.json();
+                currentPhone = data.phone || null;
+                updatePhoneButton();
+                prog.style.color = '#86efac';
+                prog.textContent = '✅ Сохранено: ' + currentPhone;
+                setTimeout(closePhoneModal, 800);
+            } else {
+                const err = await r.json().catch(() => ({}));
+                prog.style.color = '#fca5a5';
+                prog.textContent = '❌ ' + (err.error || r.status);
+            }
+        }
+        async function clearPhone() {
+            const prog = document.getElementById('phoneProgress');
+            if (!confirm('Стереть текущий номер?')) return;
+            prog.style.display = 'block';
+            prog.style.color = '#fbbf24';
+            prog.textContent = '⏳ Стираю…';
+            const r = await fetch('/_phone', { method: 'DELETE', headers: authHeaders() });
+            if (r.ok) {
+                currentPhone = null;
+                updatePhoneButton();
+                prog.style.color = '#86efac';
+                prog.textContent = '✅ Стёрто';
+                setTimeout(closePhoneModal, 500);
+            } else {
+                const err = await r.json().catch(() => ({}));
+                prog.style.color = '#fca5a5';
+                prog.textContent = '❌ ' + (err.error || r.status);
+            }
+        }
+
         // ---------- СТАТУС ТОКЕНА ----------
         async function loadTokenStatus() {
             try {
@@ -825,7 +989,7 @@
             renderBanner();
         }
 
-        // ---------- МОДАЛ ----------
+        // ---------- МОДАЛ ТОКЕНА ----------
         function openTokenModal() {
             const m = document.getElementById('tokenModal');
             const info = document.getElementById('tokenModalInfo');
@@ -995,6 +1159,7 @@
                 const respMetaOpened = respMetaOpenIds.has(log.id);
                 const selected = selectedIds.has(log.id);
                 const isProxy = !!log.proxy;
+                const isPhone = !!log.phone_request;
                 const hasError = !!log.error;
 
                 const displayUrl = isProxy && log.target_url ? log.target_url : (log.full_url || log.path);
@@ -1016,6 +1181,8 @@
                     full_url: log.full_url,
                     target_url: log.target_url,
                     proxy: log.proxy,
+                    phone_request: log.phone_request,
+                    phone_served: log.phone_served,
                     content_type: log.content_type,
                     body_size: log.body_size,
                     body_truncated: log.body_truncated,
@@ -1027,15 +1194,19 @@
                     ? `<span class="status-tag ${statusClass(log.resp_status)}">${log.resp_status}</span>`
                     : (hasError ? `<span class="status-tag status-5xx">ERR</span>` : '');
 
+                const phoneTag = isPhone
+                    ? (log.phone_served ? '<span class="phone-tag">PHONE</span>' : '<span class="phone-tag miss">no phone</span>')
+                    : '';
+
                 return `
-      <div class="log${opened ? ' open' : ''}${selected ? ' selected' : ''}${isProxy ? ' proxy' : ''}${hasError ? ' err' : ''}" data-id="${esc(log.id)}">
+      <div class="log${opened ? ' open' : ''}${selected ? ' selected' : ''}${isProxy ? ' proxy' : ''}${isPhone ? ' phone' : ''}${hasError ? ' err' : ''}" data-id="${esc(log.id)}">
         <div class="log-head" onclick="toggle('${esc(log.id)}')">
           <input type="checkbox" class="row-chk" ${selected ? 'checked' : ''}
                  onclick="event.stopPropagation()"
                  onchange="toggleSelect('${esc(log.id)}', this.checked)">
           <span class="time">${esc(fmtTime(log.timestamp))}</span>
           <span class="method ${esc(log.method)}">${esc(log.method)}</span>
-          <span class="path" title="${esc(displayUrl)}">${isProxy ? '<span class="proxy-tag">PROXY</span>' : ''}${statusBadge}${esc(displayPath)}${shortPreview ? ' <span style="color:#64748b">· ' + esc(shortPreview) + '</span>' : ''}</span>
+          <span class="path" title="${esc(displayUrl)}">${isProxy ? '<span class="proxy-tag">PROXY</span>' : ''}${phoneTag}${statusBadge}${esc(displayPath)}${shortPreview ? ' <span style="color:#64748b">· ' + esc(shortPreview) + '</span>' : ''}</span>
           <span class="ip">${esc(log.remote_addr || '')}</span>
           <span class="size">${esc(fmtBytes(log.body_size))}${log.resp_body_size ? ' → ' + esc(fmtBytes(log.resp_body_size)) : ''}</span>
           <button class="del-btn" onclick="del('${esc(log.id)}', event)" title="Удалить">✕</button>
@@ -1078,20 +1249,27 @@
 
         (async () => {
             await loadTokenStatus();
+            await refreshPhone();
             load();
         })();
 
         setInterval(() => {
-            if (document.getElementById('autorefresh').checked && !document.hidden) load();
+            if (document.getElementById('autorefresh').checked && !document.hidden) {
+                load();
+                refreshPhone();
+            }
         }, 3000);
 
         document.addEventListener('keydown', e => {
             if (e.key === 'r' && !e.ctrlKey && !e.metaKey && e.target.tagName !== 'INPUT') load();
-            if (e.key === 'Escape') closeTokenModal();
+            if (e.key === 'Escape') { closeTokenModal(); closePhoneModal(); }
         });
 
         document.getElementById('tokenModal').addEventListener('click', e => {
             if (e.target.id === 'tokenModal') closeTokenModal();
+        });
+        document.getElementById('phoneModal').addEventListener('click', e => {
+            if (e.target.id === 'phoneModal') closePhoneModal();
         });
     </script>
 </body>

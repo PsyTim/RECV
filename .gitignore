@@ -7,3 +7,9 @@ __pycache__/
 *.log
 KEYS.txt
 token.txt
+counter.txt
+logs.db
+logs.db-wal
+logs.db-shm
+logs.json
+logs.json.migrated
