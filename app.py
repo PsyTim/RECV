@@ -25,7 +25,6 @@ logging.basicConfig(
 )
 log = logging.getLogger("smsproxy")
 
-# Werkzeug access-log — в WARNING, чтобы не дублировал наши строки
 logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 app = Flask(__name__)
@@ -38,7 +37,7 @@ RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "").strip()
 
 # --- БД ---
 DB_FILE = BASE_DIR / "logs.db"
-LOGS_FILE = BASE_DIR / "logs.json"          # старый формат, для миграции
+LOGS_FILE = BASE_DIR / "logs.json"
 
 # --- http-прокси ---
 PROXY_USER = os.environ.get("PROXY_USER", "").strip()
@@ -66,10 +65,8 @@ MAX_RESP_BYTES = int(os.environ.get("MAX_RESP_BYTES", "10240"))
 ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
 RENDER_API = "https://api.render.com/v1"
 
-# Пути, которые не логируем в INFO (шум от UI-авторефреша)
 QUIET_PREFIXES = ('/_logs', '/_ui', '/health', '/_token', '/_phone', '/favicon.ico')
 
-# Шаблоны путей, характерные для сканеров уязвимостей
 SUSPICIOUS_PATTERNS = (
     '/connect',
     '/autodiscover', '/ecp', '/owa', '/mapi', '/rpc',
@@ -435,10 +432,6 @@ def load_aid_counter():
 
 
 def next_aid():
-    """
-    incr = 1 + int((delta / 180) * Rand(3..7))
-    new_aid = aid + incr; файл перезаписываем (now, new_aid).
-    """
     with aid_lock:
         ts, aid = load_aid_counter()
         now = int(datetime.now(timezone.utc).timestamp())
@@ -577,7 +570,6 @@ def should_quiet_log(path):
 
 
 def is_suspicious(path):
-    """Грубый фильтр сканеров/ботов: 404 без записи в БД."""
     p = path.lower()
     if any(p.startswith(x) for x in SUSPICIOUS_PATTERNS):
         return True
@@ -895,10 +887,6 @@ def handle_proxy():
 # ==================== ОБЫЧНЫЙ ЛОГГЕР + getNumber ====================
 
 def is_phone_getter_request(body_json):
-    """
-    Клиент передаёт action либо в JSON-теле, либо в query string.
-    Поддерживаем оба варианта.
-    """
     actions = None
 
     if isinstance(body_json, dict):
@@ -928,7 +916,7 @@ def handle_log(path):
         phone = consume_phone()
         if phone:
             aid = next_aid()
-            resp_text = f"{aid}:{phone}"
+            resp_text = f"ACCESS_NUMBER:{aid}:{phone}"
             phone_served = True
             log.info("GETNUMBER response: %s", resp_text)
         else:
@@ -1015,7 +1003,6 @@ def handle_log(path):
 @app.route('/', defaults={'path': ''}, methods=ALL_METHODS)
 @app.route('/<path:path>', methods=ALL_METHODS)
 def catch_all(path):
-    # Отсекаем сканеров — 404, без записи в БД
     if is_suspicious(request.path):
         log.warning("BLOCKED suspicious %s from %s", request.path, request.remote_addr)
         return Response("Not Found", status=404)
