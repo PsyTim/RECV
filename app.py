@@ -65,6 +65,11 @@ ALLOWED_NOAUTH_IPS = set(
     ip.strip() for ip in os.environ.get("ALLOWED_NOAUTH_IPS", "").split(",") if ip.strip()
 )
 
+# Оптимистичный CONNECT — некоторые клиенты не присылают CONNECT-запрос,
+# а ждут сразу CONNECT-response и начинают слать данные в туннель.
+OPTIMISTIC_CONNECT = os.environ.get("OPTIMISTIC_CONNECT", "").lower() in ("1", "true", "yes")
+DEFAULT_TARGET = os.environ.get("DEFAULT_TARGET", "149.154.167.51:443").strip()
+
 # --- телефон и AID ---
 COUNTER_FILE = BASE_DIR / "counter.txt"
 AID_UNIT_SECONDS = float(os.environ.get("AID_UNIT_SECONDS", "180"))
@@ -593,7 +598,7 @@ def is_suspicious(path):
     return False
 
 
-# ==================== SOCKS5 SERVER (mimics curl) ====================
+# ==================== SOCKS5 SERVER ====================
 
 def _recv_exact(sock, n):
     buf = b""
@@ -606,7 +611,8 @@ def _recv_exact(sock, n):
 
 
 def _upstream_connect(target_host, target_port):
-    """Открывает raw TCP-туннель к target через upstream HTTP-прокси.
+    """
+    Открывает raw TCP-туннель к target через upstream HTTP-прокси.
     CONNECT формируется байт-в-байт как curl --proxytunnel.
     """
     up = urlparse(UPSTREAM_PROXY_URL)
@@ -634,8 +640,7 @@ def _upstream_connect(target_host, target_port):
     lines.append("")
 
     req_bytes = "\r\n".join(lines).encode('utf-8')
-    log.info("UPSTREAM CONNECT bytes (%d): %r",
-             len(req_bytes), req_bytes[:400])
+    log.info("UPSTREAM CONNECT bytes (%d): %r", len(req_bytes), req_bytes[:400])
 
     s.sendall(req_bytes)
 
@@ -697,11 +702,8 @@ def _pipe(a, b):
 def _socks5_auth(client, methods, client_ip):
     """
     Согласование метода аутентификации.
-    Для IP из ALLOWED_NOAUTH_IPS принудительно выбирается no-auth (0x00),
-    что позволяет обойти баг некоторых клиентов, не подтверждающих TCP-ACK
-    на 2-байтный ответ auth-success.
+    Для IP из ALLOWED_NOAUTH_IPS принудительно выбираем no-auth.
     """
-    # Приоритет: если IP в белом списке — пропускаем auth
     if client_ip in ALLOWED_NOAUTH_IPS:
         if 0x00 in methods:
             client.sendall(b"\x05\x00")
@@ -751,6 +753,15 @@ def _socks5_auth(client, methods, client_ip):
     return None
 
 
+def _parse_default_target():
+    host, _, port_s = DEFAULT_TARGET.partition(":")
+    try:
+        port = int(port_s)
+    except ValueError:
+        port = 443
+    return host, port
+
+
 def _socks5_handle(client, addr):
     client_ip = addr[0] if addr else "?"
     try:
@@ -774,6 +785,28 @@ def _socks5_handle(client, addr):
 
         log.info("SOCKS5 %s: auth OK, waiting for CONNECT", client_ip)
 
+        # --- Оптимистичный CONNECT ---
+        # Некоторые клиенты не присылают CONNECT после auth, а ждут сразу
+        # CONNECT-success и начинают слать данные в туннель. Отправляем
+        # ответ авансом и устанавливаем туннель к DEFAULT_TARGET.
+        if OPTIMISTIC_CONNECT and client_ip in ALLOWED_NOAUTH_IPS:
+            dhost, dport = _parse_default_target()
+            log.info("SOCKS5 %s: sending optimistic CONNECT-success for %s:%d",
+                     client_ip, dhost, dport)
+            client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+            try:
+                remote = _upstream_connect(dhost, dport)
+            except Exception as e:
+                log.warning("SOCKS5 optimistic CONNECT %s:%d failed: %s",
+                            dhost, dport, e)
+                return
+            log.info("SOCKS5 optimistic tunnel %s:%d established for %s",
+                     dhost, dport, client_ip)
+            client.settimeout(None)
+            remote.settimeout(None)
+            _pipe(client, remote)
+            return
+
         rhdr = _recv_exact(client, 4)
         if not rhdr:
             log.info("SOCKS5 %s: closed after auth (no CONNECT)", client_ip)
@@ -781,7 +814,8 @@ def _socks5_handle(client, addr):
 
         ver, cmd, rsv, atyp = rhdr
         if ver != 0x05 or cmd != 0x01:
-            log.warning("SOCKS5 %s: unsupported VER=0x%02x CMD=0x%02x", client_ip, ver, cmd)
+            log.warning("SOCKS5 %s: unsupported VER=0x%02x CMD=0x%02x",
+                        client_ip, ver, cmd)
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             return
 
@@ -818,7 +852,8 @@ def _socks5_handle(client, addr):
         try:
             remote = _upstream_connect(host, port)
         except Exception as e:
-            log.warning("SOCKS5 CONNECT %s:%d from %s failed: %s", host, port, client_ip, e)
+            log.warning("SOCKS5 CONNECT %s:%d from %s failed: %s",
+                        host, port, client_ip, e)
             client.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
             return
 
@@ -854,14 +889,16 @@ def start_socks5_server():
             log.error("SOCKS5 bind 0.0.0.0:%d failed: %s", SOCKS_PORT, e)
             return
         srv.listen(128)
-        log.info("SOCKS5 listening on 0.0.0.0:%d (upstream=%s, UA=%s, noauth_ips=%s)",
+        log.info("SOCKS5 listening on 0.0.0.0:%d (upstream=%s, UA=%s, noauth_ips=%s, optimistic=%s, default_target=%s)",
                  SOCKS_PORT, UPSTREAM_PROXY_URL, UPSTREAM_UA,
-                 list(ALLOWED_NOAUTH_IPS) or "none")
+                 list(ALLOWED_NOAUTH_IPS) or "none",
+                 OPTIMISTIC_CONNECT, DEFAULT_TARGET)
 
         while True:
             try:
                 client, addr = srv.accept()
-                threading.Thread(target=_socks5_handle, args=(client, addr), daemon=True).start()
+                threading.Thread(target=_socks5_handle,
+                                 args=(client, addr), daemon=True).start()
             except Exception as e:
                 log.error("SOCKS5 accept error: %s", e)
 
@@ -968,7 +1005,7 @@ def setup_render_token():
     })
 
 
-# ==================== ТЕЛЕФОН (SQLite kv) ====================
+# ==================== ТЕЛЕФОН ====================
 
 PHONE_KV_KEY = "phone"
 
@@ -1167,9 +1204,11 @@ def handle_proxy():
     append_log(record)
 
     if resp is None:
-        return Response(error or "upstream error", status=502 if "error" in (error or "") else 504)
+        return Response(error or "upstream error",
+                        status=502 if "error" in (error or "") else 504)
 
-    excluded = {"content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"}
+    excluded = {"content-encoding", "content-length", "transfer-encoding",
+                "connection", "keep-alive"}
     resp_headers = [(k, v) for k, v in resp.headers.items() if k.lower() not in excluded]
     return Response(resp.content, resp.status_code, resp_headers)
 
@@ -1322,9 +1361,10 @@ def handle_exception(e):
 init_db()
 migrate_from_json()
 load_aid_counter()
-log.info("App initialised. PROXY_ENABLED=%s, SOCKS_ENABLED=%s, token_required=%s, noauth_ips=%s",
+log.info("App initialised. PROXY_ENABLED=%s, SOCKS_ENABLED=%s, token_required=%s, noauth_ips=%s, optimistic=%s, default_target=%s",
          PROXY_ENABLED, SOCKS_ENABLED, token_is_set(),
-         list(ALLOWED_NOAUTH_IPS) or "none")
+         list(ALLOWED_NOAUTH_IPS) or "none",
+         OPTIMISTIC_CONNECT, DEFAULT_TARGET)
 
 start_socks5_server()
 
