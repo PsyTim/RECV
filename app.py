@@ -5,6 +5,7 @@ import threading
 import uuid
 import random
 import sqlite3
+import logging
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
@@ -14,6 +15,16 @@ from flask import Flask, request, jsonify, Response
 BASE_DIR = Path(__file__).resolve().parent
 os.chdir(BASE_DIR)
 
+# ==================== ЛОГИРОВАНИЕ ====================
+
+logging.basicConfig(
+    level=os.environ.get("LOG_LEVEL", "INFO").upper(),
+    format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
+    force=True,
+)
+log = logging.getLogger("smsproxy")
+
 app = Flask(__name__)
 
 # --- токен логов ---
@@ -22,9 +33,9 @@ ENV_TOKEN = os.environ.get("LOGS_TOKEN", "").strip()
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "").strip()
 
-# --- персистентность логов (SQLite) ---
+# --- персистентность логов ---
 DB_FILE = BASE_DIR / "logs.db"
-LOGS_FILE = BASE_DIR / "logs.json"          # старый формат, для миграции
+LOGS_FILE = BASE_DIR / "logs.json"
 
 # --- http-прокси ---
 PROXY_USER = os.environ.get("PROXY_USER", "").strip()
@@ -42,8 +53,6 @@ AID_UNIT_SECONDS = float(os.environ.get("AID_UNIT_SECONDS", "180"))
 AID_RAND_MIN = int(os.environ.get("AID_RAND_MIN", "3"))
 AID_RAND_MAX = int(os.environ.get("AID_RAND_MAX", "7"))
 
-current_phone = None
-phone_lock = threading.Lock()
 aid_lock = threading.Lock()
 
 # --- лимиты ---
@@ -103,7 +112,34 @@ def init_db():
         )
     """)
     _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)")
+    # Хранилище key-value: используется для хранения телефона (кросс-воркерное)
+    _db_conn.execute("""
+        CREATE TABLE IF NOT EXISTS kv (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
     _db_conn.commit()
+    log.info("DB initialised at %s", DB_FILE)
+
+
+def kv_get(key):
+    with db_lock:
+        cur = _db_conn.execute("SELECT value FROM kv WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else None
+
+
+def kv_set(key, value):
+    with db_lock:
+        if value is None:
+            _db_conn.execute("DELETE FROM kv WHERE key = ?", (key,))
+        else:
+            _db_conn.execute(
+                "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
+                (key, str(value)),
+            )
+        _db_conn.commit()
 
 
 def _to_json(x):
@@ -264,10 +300,11 @@ def migrate_from_json():
             _db_conn.commit()
         try:
             LOGS_FILE.rename(LOGS_FILE.with_suffix('.json.migrated'))
+            log.info("Migrated %d logs from logs.json", len(data))
         except Exception:
             pass
-    except Exception:
-        pass
+    except Exception as e:
+        log.warning("Migration from logs.json failed: %s", e)
 
 
 # ==================== ТОКЕН ====================
@@ -357,6 +394,7 @@ def _new_aid_counter():
     ts = int(datetime.now(timezone.utc).timestamp())
     aid = random.randint(100000, 999999)
     _write_counter_file(ts, aid)
+    log.info("AID counter initialised: %d (ts=%d)", aid, ts)
     return ts, aid
 
 
@@ -368,11 +406,6 @@ def load_aid_counter():
 
 
 def next_aid():
-    """
-    INCR = 1 + int((Now - timestamp) / 180 * Rand(3..7))
-    new_aid = aid + INCR
-    После выдачи: в файл пишем (now, new_aid)
-    """
     with aid_lock:
         ts, aid = load_aid_counter()
         now = int(datetime.now(timezone.utc).timestamp())
@@ -381,6 +414,8 @@ def next_aid():
         incr = 1 + int((delta / AID_UNIT_SECONDS) * multiplier)
         new_aid = aid + incr
         _write_counter_file(now, new_aid)
+        log.info("AID: %d -> %d (delta=%ds, rand=%d, incr=%d)",
+                 aid, new_aid, delta, multiplier, incr)
         return new_aid
 
 
@@ -535,13 +570,16 @@ def set_token_local():
 
     ok, err = validate_token(new_token)
     if not ok:
+        log.warning("TOKEN set rejected: %s", err)
         return jsonify({"error": err}), 400
     if ENV_TOKEN:
         return jsonify({"error": "token is set via env variable"}), 403
     if token_is_set() and not check_token():
+        log.warning("TOKEN set rejected: unauthorized from %s", request.remote_addr)
         return jsonify({"error": "unauthorized"}), 401
 
     save_file_token(new_token)
+    log.info("TOKEN saved to file")
     return jsonify({"status": "ok", "source": "file"})
 
 
@@ -554,6 +592,7 @@ def remove_token_local():
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
     delete_file_token()
+    log.info("TOKEN removed")
     return jsonify({"status": "removed"})
 
 
@@ -580,6 +619,7 @@ def setup_render_token():
     try:
         r = requests.put(url, headers=headers, json={"value": new_token}, timeout=15)
     except Exception as e:
+        log.error("RENDER API PUT failed: %s", e)
         return jsonify({"error": f"request to Render failed: {e}"}), 502
     if r.status_code not in (200, 201):
         return jsonify({"error": "failed to update env var", "status": r.status_code, "details": r.text[:500]}), 502
@@ -599,41 +639,55 @@ def setup_render_token():
     })
 
 
-# ==================== ТЕЛЕФОН ====================
+# ==================== ТЕЛЕФОН (в SQLite kv) ====================
+
+PHONE_KV_KEY = "phone"
+
 
 def get_current_phone():
-    with phone_lock:
-        return current_phone
+    return kv_get(PHONE_KV_KEY)
 
 
 def set_current_phone(phone):
-    global current_phone
-    with phone_lock:
-        current_phone = phone or None
+    kv_set(PHONE_KV_KEY, phone if phone else None)
 
 
 def consume_phone():
-    global current_phone
-    with phone_lock:
-        phone = current_phone
-        current_phone = None
+    with db_lock:
+        cur = _db_conn.execute("SELECT value FROM kv WHERE key = ?", (PHONE_KV_KEY,))
+        row = cur.fetchone()
+        phone = row["value"] if row else None
+        if phone:
+            _db_conn.execute("DELETE FROM kv WHERE key = ?", (PHONE_KV_KEY,))
+            _db_conn.commit()
+    if phone:
+        log.info("PHONE consumed: %r", phone)
+    else:
+        log.info("PHONE consume requested, but empty")
     return phone
 
 
 @app.route('/_phone', methods=['GET', 'POST', 'DELETE'])
 def phone_endpoint():
     if not check_token():
+        log.warning("PHONE %s unauthorized from %s", request.method, request.remote_addr)
         return jsonify({"error": "unauthorized"}), 401
 
     if request.method == 'GET':
-        return jsonify({"phone": get_current_phone()})
+        phone = get_current_phone()
+        log.info("PHONE GET -> %r", phone)
+        return jsonify({"phone": phone})
 
     if request.method == 'POST':
         data = request.get_json(silent=True) or {}
         new_phone = (data.get("phone") or "").strip()
+        log.info("PHONE POST <- %r from %s", new_phone, request.remote_addr)
         set_current_phone(new_phone)
-        return jsonify({"status": "ok", "phone": get_current_phone()})
+        saved = get_current_phone()
+        log.info("PHONE saved: %r", saved)
+        return jsonify({"status": "ok", "phone": saved})
 
+    log.info("PHONE DELETE from %s", request.remote_addr)
     set_current_phone(None)
     return jsonify({"status": "cleared"})
 
@@ -658,6 +712,7 @@ def clear_logs():
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
     db_clear_logs()
+    log.info("LOGS cleared by %s", request.remote_addr)
     return jsonify({"status": "cleared"})
 
 
@@ -670,6 +725,7 @@ def delete_batch():
     if not isinstance(ids, list):
         return jsonify({"error": "ids must be an array"}), 400
     removed = db_delete_batch(ids)
+    log.info("LOGS batch delete: requested=%d removed=%d", len(set(ids)), removed)
     return jsonify({"status": "deleted", "removed": removed, "requested": len(set(ids))})
 
 
@@ -678,6 +734,7 @@ def delete_log(log_id):
     if not check_token():
         return jsonify({"error": "unauthorized"}), 401
     if db_delete_log(log_id):
+        log.info("LOG deleted: %s", log_id)
         return jsonify({"status": "deleted", "id": log_id})
     return jsonify({"error": "not found"}), 404
 
@@ -686,6 +743,7 @@ def delete_log(log_id):
 
 def handle_proxy():
     if not check_proxy_auth():
+        log.warning("PROXY auth failed from %s", request.remote_addr)
         return Response(
             "Proxy authentication required",
             status=407,
@@ -727,10 +785,13 @@ def handle_proxy():
             timeout=PROXY_TIMEOUT,
             allow_redirects=False,
         )
+        log.info("PROXY %s %s -> %s", request.method, target_url, resp.status_code)
     except requests.Timeout:
         error = "upstream timeout"
+        log.error("PROXY %s %s timeout", request.method, target_url)
     except requests.RequestException as e:
         error = f"upstream error: {e}"
+        log.error("PROXY %s %s error: %s", request.method, target_url, e)
 
     record = {
         "id": uuid.uuid4().hex[:12],
@@ -769,15 +830,9 @@ def handle_proxy():
         })
     else:
         record.update({
-            "resp_status": None,
-            "resp_reason": None,
-            "resp_headers": None,
-            "resp_body_text": None,
-            "resp_body_json": None,
-            "resp_body_encoding": None,
-            "resp_body_size": 0,
-            "resp_body_truncated": False,
-            "resp_content_type": None,
+            "resp_status": None, "resp_reason": None, "resp_headers": None,
+            "resp_body_text": None, "resp_body_json": None, "resp_body_encoding": None,
+            "resp_body_size": 0, "resp_body_truncated": False, "resp_content_type": None,
             "error": error,
         })
 
@@ -811,14 +866,17 @@ def handle_log(path):
     cookies = {k: v for k, v in request.cookies.items()}
 
     if is_phone_getter_request(body_json):
+        log.info("GETNUMBER request from %s at %s", request.remote_addr, request.path)
         phone = consume_phone()
         if phone:
             aid = next_aid()
             resp_text = f"{aid}:{phone}"
             phone_served = True
+            log.info("GETNUMBER response: %s", resp_text)
         else:
             resp_text = "-"
             phone_served = False
+            log.info("GETNUMBER response: - (no phone)")
 
         resp_body = resp_text.encode('utf-8')
         r_text, r_enc, r_json, r_trunc, r_size = decode_response_body(resp_body)
@@ -843,15 +901,11 @@ def handle_log(path):
             "body_size": body_size,
             "body_truncated": truncated,
             "form": request.form.to_dict(flat=False) if request.form else {},
-            "resp_status": 200,
-            "resp_reason": "OK",
+            "resp_status": 200, "resp_reason": "OK",
             "resp_headers": {"Content-Type": "text/plain"},
-            "resp_body_text": r_text,
-            "resp_body_json": None,
-            "resp_body_encoding": r_enc,
-            "resp_body_size": r_size,
-            "resp_body_truncated": r_trunc,
-            "resp_content_type": "text/plain",
+            "resp_body_text": r_text, "resp_body_json": None,
+            "resp_body_encoding": r_enc, "resp_body_size": r_size,
+            "resp_body_truncated": r_trunc, "resp_content_type": "text/plain",
             "error": None,
         }
         append_log(record)
@@ -885,15 +939,11 @@ def handle_log(path):
         "body_size": body_size,
         "body_truncated": truncated,
         "form": request.form.to_dict(flat=False) if request.form else {},
-        "resp_status": 200,
-        "resp_reason": "OK",
+        "resp_status": 200, "resp_reason": "OK",
         "resp_headers": {"Content-Type": "application/json"},
-        "resp_body_text": r_text,
-        "resp_body_json": r_json,
-        "resp_body_encoding": r_enc,
-        "resp_body_size": r_size,
-        "resp_body_truncated": r_trunc,
-        "resp_content_type": "application/json",
+        "resp_body_text": r_text, "resp_body_json": r_json,
+        "resp_body_encoding": r_enc, "resp_body_size": r_size,
+        "resp_body_truncated": r_trunc, "resp_content_type": "application/json",
         "error": None,
     }
     append_log(record)
@@ -907,9 +957,24 @@ def handle_log(path):
 @app.route('/', defaults={'path': ''}, methods=ALL_METHODS)
 @app.route('/<path:path>', methods=ALL_METHODS)
 def catch_all(path):
-    if PROXY_ENABLED and is_proxy_request():
+    is_proxy = PROXY_ENABLED and is_proxy_request()
+
+    # Логируем все запросы, кроме служебных (/_ui, /_logs, /health — слишком шумные)
+    if not request.path.startswith(('/_logs', '/_ui', '/health', '/_token')):
+        log.info("REQ %s %s from %s proxy=%s",
+                 request.method, request.full_path.rstrip('?'), request.remote_addr, is_proxy)
+
+    if is_proxy:
         return handle_proxy()
     return handle_log(path)
+
+
+# ==================== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ====================
+
+@app.errorhandler(Exception)
+def handle_exception(e):
+    log.exception("Unhandled exception on %s %s", request.method, request.path)
+    return jsonify({"error": "internal server error", "type": type(e).__name__}), 500
 
 
 # ==================== ИНИЦИАЛИЗАЦИЯ ====================
@@ -917,6 +982,8 @@ def catch_all(path):
 init_db()
 migrate_from_json()
 load_aid_counter()
+log.info("App initialised. PROXY_ENABLED=%s, token_required=%s",
+         PROXY_ENABLED, token_is_set())
 
 
 if __name__ == '__main__':

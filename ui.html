@@ -474,6 +474,10 @@
             color: #60a5fa;
         }
 
+        .log-body h3.raw-h {
+            color: #a855f7;
+        }
+
         pre {
             background: #0f172a;
             border: 1px solid #1e293b;
@@ -486,7 +490,7 @@
             font-family: ui-monospace, 'SF Mono', Menlo, monospace;
             white-space: pre-wrap;
             word-break: break-word;
-            max-height: 320px;
+            max-height: 420px;
             overflow-y: auto;
         }
 
@@ -514,6 +518,14 @@
 
         details.meta[open]>summary {
             margin-bottom: 6px;
+        }
+
+        details.meta.raw-json>summary {
+            color: #a855f7;
+        }
+
+        details.meta.raw-json>summary:hover {
+            color: #c084fc;
         }
 
         .footer {
@@ -674,8 +686,7 @@
             <div class="modal-section" id="sectionLocal">
                 <div class="modal-section-title">Установить локально (файл token.txt)</div>
                 <div class="hint">Токен хранится в файле рядом с app.py. Только печатные ASCII: латиница, цифры,
-                    <code>- _ . ~</code>. Минимум 8 символов.
-                </div>
+                    <code>- _ . ~</code>. Минимум 8 символов.</div>
                 <div class="gen-row">
                     <input type="text" id="tokenLocalInput" placeholder="Токен">
                     <button onclick="generateToken('tokenLocalInput')" title="Сгенерировать">🎲</button>
@@ -690,7 +701,7 @@
             <div class="modal-section" id="sectionRender" style="display:none">
                 <div class="modal-section-title">Установить через Render API</div>
                 <div class="hint">Записывает <code>LOGS_TOKEN</code> в env-переменные сервиса и запускает деплой (30–60
-                    сек). Требует env-переменные <code>RENDER_API_KEY</code> и <code>RENDER_SERVICE_ID</code>.</div>
+                    сек).</div>
                 <div class="gen-row">
                     <input type="text" id="tokenRenderInput" placeholder="Токен">
                     <button onclick="generateToken('tokenRenderInput')" title="Сгенерировать">🎲</button>
@@ -713,7 +724,7 @@
         <div class="modal">
             <h2>📞 Телефонный номер</h2>
             <div class="modal-info">
-                Номер будет храниться в памяти сервера и выдан один раз в ответ на запрос с
+                Номер будет храниться в БД и выдан один раз в ответ на запрос с
                 <code>action: ["getNumber"]</code>, после чего будет стёрт.
             </div>
 
@@ -744,6 +755,7 @@
         const openIds = new Set();
         const metaOpenIds = new Set();
         const respMetaOpenIds = new Set();
+        const rawOpenIds = new Set();
         const selectedIds = new Set();
         let tokenStatus = { required: false, source: null, env_locked: false, render_api_available: false, can_set_local: false, can_delete_local: false };
         let currentPhone = null;
@@ -1127,12 +1139,12 @@
             ev.stopPropagation();
             if (!confirm('Удалить эту запись?')) return;
             const r = await fetch('/_logs/' + id, { method: 'DELETE', headers: authHeaders() });
-            if (r.ok) { openIds.delete(id); metaOpenIds.delete(id); respMetaOpenIds.delete(id); selectedIds.delete(id); load(); }
+            if (r.ok) { openIds.delete(id); metaOpenIds.delete(id); respMetaOpenIds.delete(id); rawOpenIds.delete(id); selectedIds.delete(id); load(); }
         }
         async function clearAll() {
             if (!confirm('Удалить ВСЕ записи? Действие необратимо.')) return;
             const r = await fetch('/_logs/clear', { method: 'POST', headers: authHeaders() });
-            if (r.ok) { openIds.clear(); metaOpenIds.clear(); respMetaOpenIds.clear(); selectedIds.clear(); load(); }
+            if (r.ok) { openIds.clear(); metaOpenIds.clear(); respMetaOpenIds.clear(); rawOpenIds.clear(); selectedIds.clear(); load(); }
         }
         function toggle(id) {
             if (openIds.has(id)) openIds.delete(id); else openIds.add(id);
@@ -1144,6 +1156,9 @@
         }
         function toggleRespMeta(id, isOpen) {
             if (isOpen) respMetaOpenIds.add(id); else respMetaOpenIds.delete(id);
+        }
+        function toggleRaw(id, isOpen) {
+            if (isOpen) rawOpenIds.add(id); else rawOpenIds.delete(id);
         }
 
         function render() {
@@ -1157,6 +1172,7 @@
                 const opened = openIds.has(log.id);
                 const metaOpened = metaOpenIds.has(log.id);
                 const respMetaOpened = respMetaOpenIds.has(log.id);
+                const rawOpened = rawOpenIds.has(log.id);
                 const selected = selectedIds.has(log.id);
                 const isProxy = !!log.proxy;
                 const isPhone = !!log.phone_request;
@@ -1198,6 +1214,9 @@
                     ? (log.phone_served ? '<span class="phone-tag">PHONE</span>' : '<span class="phone-tag miss">no phone</span>')
                     : '';
 
+                // Полный JSON: только непустые поля, чтобы было читаемо
+                const fullJson = JSON.stringify(log, null, 2);
+
                 return `
       <div class="log${opened ? ' open' : ''}${selected ? ' selected' : ''}${isProxy ? ' proxy' : ''}${isPhone ? ' phone' : ''}${hasError ? ' err' : ''}" data-id="${esc(log.id)}">
         <div class="log-head" onclick="toggle('${esc(log.id)}')">
@@ -1234,6 +1253,11 @@
           <details class="meta" ${metaOpened ? 'open' : ''} ontoggle="toggleMeta('${esc(log.id)}', this.open)">
             <summary>Metadata</summary>
             <pre>${esc(JSON.stringify(meta, null, 2))}</pre>
+          </details>
+
+          <details class="meta raw-json" ${rawOpened ? 'open' : ''} ontoggle="toggleRaw('${esc(log.id)}', this.open)">
+            <summary>▸ Full exchange (JSON)</summary>
+            <pre>${esc(fullJson)}</pre>
           </details>
         </div>
       </div>
