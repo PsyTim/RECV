@@ -482,7 +482,7 @@
                     <button onclick="generateToken('tokenLocalInput')" title="Сгенерировать">🎲</button>
                 </div>
                 <div class="modal-actions" style="margin-top:10px;">
-                    <button onclick="saveTokenLocal()" class="primary">Сохранить локально</button>
+                    <button onclick="saveTokenLocal()" id="btnSaveLocal" class="primary">Сохранить локально</button>
                     <button class="danger" onclick="removeTokenLocal()" id="btnRemoveLocal" style="display:none">Удалить
                         локальный</button>
                 </div>
@@ -516,7 +516,6 @@
         const metaOpenIds = new Set();
         let tokenStatus = { required: false, source: null, env_locked: false, render_api_available: false, can_set_local: false, can_delete_local: false };
 
-        // --- ASCII-only токен ---
         function isAsciiToken(t) {
             if (!t || t.length < 8) return false;
             for (let i = 0; i < t.length; i++) {
@@ -532,7 +531,6 @@
             document.getElementById(inputId).value = t;
         }
 
-        // --- Чистим плохой токен из localStorage ДО первого запроса ---
         (function sanitizeStoredToken() {
             try {
                 const t = localStorage.getItem(TOKEN_KEY);
@@ -585,6 +583,7 @@
 
         function updateTokenBadge() {
             const b = document.getElementById('tokenBadge');
+            if (!b) return;
             if (!tokenStatus.required) {
                 b.textContent = '🔓 открыто';
                 b.style.background = '#7f1d1d'; b.style.color = '#fca5a5';
@@ -599,6 +598,7 @@
 
         function renderBanner() {
             const el = document.getElementById('banner');
+            if (!el) return;
             if (tokenStatus.required || sessionStorage.getItem('token_banner_dismissed')) {
                 el.innerHTML = '';
                 return;
@@ -626,50 +626,61 @@
             const info = document.getElementById('tokenModalInfo');
             const sectionLocal = document.getElementById('sectionLocal');
             const sectionRender = document.getElementById('sectionRender');
+            const btnSaveLocal = document.getElementById('btnSaveLocal');
+            const btnRemoveLocal = document.getElementById('btnRemoveLocal');
+            const btnSaveRender = document.getElementById('btnSaveRender');
+            const inputLocal = document.getElementById('tokenLocalInput');
+            const inputRender = document.getElementById('tokenRenderInput');
+            const progress = document.getElementById('renderProgress');
 
-            document.getElementById('tokenLocalInput').value = '';
-            document.getElementById('tokenRenderInput').value = '';
-            document.getElementById('renderProgress').style.display = 'none';
-            document.getElementById('renderProgress').textContent = '';
+            if (!m) return;
+            if (inputLocal) inputLocal.value = '';
+            if (inputRender) inputRender.value = '';
+            if (progress) { progress.style.display = 'none'; progress.textContent = ''; }
 
-            if (tokenStatus.source === 'env') {
-                info.innerHTML = 'Токен задан через <code>LOGS_TOKEN</code> в env-переменных.' +
-                    (tokenStatus.render_api_available
-                        ? ' Его можно переустановить через Render API.'
-                        : ' Менять можно только в Render Dashboard.');
-            } else if (tokenStatus.can_set_local) {
-                info.innerHTML = 'Токен ещё не установлен. Выберите способ установки ниже.';
-            } else {
-                info.innerHTML = 'Токен уже установлен. Можно заменить или удалить.';
+            if (info) {
+                if (tokenStatus.source === 'env') {
+                    info.innerHTML = 'Токен задан через <code>LOGS_TOKEN</code> в env-переменных.' +
+                        (tokenStatus.render_api_available
+                            ? ' Его можно переустановить через Render API.'
+                            : ' Менять можно только в Render Dashboard.');
+                } else if (tokenStatus.can_set_local) {
+                    info.innerHTML = 'Токен ещё не установлен. Выберите способ установки ниже.';
+                } else {
+                    info.innerHTML = 'Токен уже установлен. Можно заменить или удалить.';
+                }
             }
 
-            if (tokenStatus.can_set_local) {
-                sectionLocal.style.display = '';
-                document.getElementById('btnRemoveLocal').style.display = tokenStatus.can_delete_local ? '' : 'none';
-                document.getElementById('btnSaveLocal').textContent = tokenStatus.source === 'file' ? 'Заменить локальный' : 'Сохранить локально';
-            } else {
-                sectionLocal.style.display = 'none';
+            if (sectionLocal) {
+                if (tokenStatus.can_set_local) {
+                    sectionLocal.style.display = '';
+                    if (btnRemoveLocal) btnRemoveLocal.style.display = tokenStatus.can_delete_local ? '' : 'none';
+                    if (btnSaveLocal) btnSaveLocal.textContent = tokenStatus.source === 'file' ? 'Заменить локальный' : 'Сохранить локально';
+                } else {
+                    sectionLocal.style.display = 'none';
+                }
             }
 
-            if (tokenStatus.render_api_available) {
-                sectionRender.style.display = '';
-                document.getElementById('btnSaveRender').textContent =
-                    tokenStatus.source === 'env' ? 'Переустановить через Render' : 'Установить через Render';
-            } else {
-                sectionRender.style.display = 'none';
+            if (sectionRender) {
+                if (tokenStatus.render_api_available) {
+                    sectionRender.style.display = '';
+                    if (btnSaveRender) btnSaveRender.textContent =
+                        tokenStatus.source === 'env' ? 'Переустановить через Render' : 'Установить через Render';
+                } else {
+                    sectionRender.style.display = 'none';
+                }
             }
 
             m.style.display = 'flex';
             setTimeout(() => {
-                const firstInput = sectionLocal.style.display !== 'none'
-                    ? document.getElementById('tokenLocalInput')
-                    : document.getElementById('tokenRenderInput');
+                const firstInput = (sectionLocal && sectionLocal.style.display !== 'none') ? inputLocal : inputRender;
                 if (firstInput) firstInput.focus();
             }, 50);
         }
 
         function closeTokenModal() {
-            document.getElementById('tokenModal').style.display = 'none';
+            const m = document.getElementById('tokenModal');
+            if (m) m.style.display = 'none';
         }
 
         async function saveTokenLocal() {
