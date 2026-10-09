@@ -30,6 +30,19 @@ ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
 RENDER_API = "https://api.render.com/v1"
 
 
+# ------------------- ВАЛИДАЦИЯ ТОКЕНА -------------------
+
+def validate_token(t):
+    """Токен: 8+ символов, только печатные ASCII (0x21..0x7E)."""
+    if not t or len(t) < 8:
+        return False, "token too short (min 8 chars)"
+    for ch in t:
+        o = ord(ch)
+        if o < 0x21 or o > 0x7E:
+            return False, "token must contain only printable ASCII characters (no spaces, no non-latin)"
+    return True, None
+
+
 # ------------------- ТОКЕН -------------------
 
 def load_file_token():
@@ -58,7 +71,6 @@ def delete_file_token():
 
 
 def get_active_token():
-    """(token, source). Env важнее файла."""
     if ENV_TOKEN:
         return ENV_TOKEN, "env"
     file_tok = load_file_token()
@@ -134,7 +146,7 @@ def token_status():
     file_tok = load_file_token()
     return jsonify({
         "required": bool(active),
-        "source": source,                                     # "env" | "file" | null
+        "source": source,
         "env_locked": bool(ENV_TOKEN),
         "render_api_available": render_api_available(),
         "can_set_local": (not ENV_TOKEN),
@@ -147,11 +159,12 @@ def set_token_local():
     data = request.get_json(silent=True) or {}
     new_token = (data.get("token") or "").strip()
 
-    if len(new_token) < 8:
-        return jsonify({"error": "token too short (min 8 chars)"}), 400
+    ok, err = validate_token(new_token)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     if ENV_TOKEN:
-        return jsonify({"error": "token is set via env variable. Use Render API setup or change env in Dashboard."}), 403
+        return jsonify({"error": "token is set via env variable"}), 403
 
     existing = load_file_token()
     if existing and not check_token():
@@ -178,7 +191,6 @@ def remove_token_local():
 
 @app.route('/_setup_render_token', methods=['POST'])
 def setup_render_token():
-    """Устанавливает LOGS_TOKEN в Render через Render API + перезапускает сервис."""
     if not render_api_available():
         return jsonify({
             "error": "RENDER_API_KEY and RENDER_SERVICE_ID must be set as env variables on this service"
@@ -186,8 +198,10 @@ def setup_render_token():
 
     data = request.get_json(silent=True) or {}
     new_token = (data.get("token") or "").strip()
-    if len(new_token) < 8:
-        return jsonify({"error": "token too short (min 8 chars)"}), 400
+
+    ok, err = validate_token(new_token)
+    if not ok:
+        return jsonify({"error": err}), 400
 
     headers = {
         "Authorization": f"Bearer {RENDER_API_KEY}",
@@ -195,7 +209,6 @@ def setup_render_token():
         "Content-Type": "application/json",
     }
 
-    # 1) Установить env-переменную LOGS_TOKEN
     url = f"{RENDER_API}/services/{RENDER_SERVICE_ID}/env-vars/LOGS_TOKEN"
     try:
         r = requests.put(url, headers=headers, json={"value": new_token}, timeout=15)
@@ -209,7 +222,6 @@ def setup_render_token():
             "details": r.text[:500],
         }), 502
 
-    # 2) Запустить деплой, чтобы применилось
     deploy_url = f"{RENDER_API}/services/{RENDER_SERVICE_ID}/deploys"
     try:
         d = requests.post(deploy_url, headers=headers,

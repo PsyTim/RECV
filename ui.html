@@ -74,7 +74,8 @@
             background: #2563eb;
         }
 
-        input[type=password] {
+        input[type=password],
+        input[type=text] {
             padding: 7px 10px;
             background: #0f172a;
             color: #e2e8f0;
@@ -125,6 +126,12 @@
             padding: 12px 16px;
             border-radius: 8px;
             font-size: 13px;
+        }
+
+        .banner.error {
+            background: #7f1d1d;
+            border-color: #991b1b;
+            color: #fecaca;
         }
 
         .banner-actions {
@@ -414,6 +421,19 @@
             margin-top: 6px;
         }
 
+        .gen-row {
+            display: flex;
+            gap: 8px;
+            align-items: center;
+            margin-top: 6px;
+        }
+
+        .gen-row input {
+            flex: 1;
+            margin-bottom: 0 !important;
+            font-family: ui-monospace, monospace;
+        }
+
         @media (max-width: 700px) {
             .log-head {
                 grid-template-columns: 70px 1fr 50px 30px;
@@ -453,29 +473,30 @@
 
             <div class="modal-info" id="tokenModalInfo"></div>
 
-            <!-- Секция 1: установка локально (token.txt) -->
             <div class="modal-section" id="sectionLocal">
                 <div class="modal-section-title">Установить локально (файл token.txt)</div>
-                <div class="hint">Простой способ. Токен хранится в файле рядом с app.py. На бесплатном Render пропадёт
-                    после пересборки/засыпания сервиса.</div>
-                <input type="password" id="tokenLocalInput" placeholder="Токен (мин. 8 символов)"
-                    style="margin-top:10px;">
-                <div class="modal-actions">
-                    <button onclick="saveTokenLocal()" id="btnSaveLocal" class="primary">Сохранить локально</button>
+                <div class="hint">Токен хранится в файле рядом с app.py. Только печатные ASCII: латиница, цифры,
+                    <code>- _ . ~</code>. Минимум 8 символов.</div>
+                <div class="gen-row">
+                    <input type="text" id="tokenLocalInput" placeholder="Токен">
+                    <button onclick="generateToken('tokenLocalInput')" title="Сгенерировать">🎲</button>
+                </div>
+                <div class="modal-actions" style="margin-top:10px;">
+                    <button onclick="saveTokenLocal()" class="primary">Сохранить локально</button>
                     <button class="danger" onclick="removeTokenLocal()" id="btnRemoveLocal" style="display:none">Удалить
                         локальный</button>
                 </div>
             </div>
 
-            <!-- Секция 2: установка через Render API -->
             <div class="modal-section" id="sectionRender" style="display:none">
                 <div class="modal-section-title">Установить через Render API</div>
-                <div class="hint">Токен будет записан в env-переменную <code>LOGS_TOKEN</code> сервиса на Render, после
-                    чего сервис перезапустится (30–60 сек). Требует наличия env-переменных <code>RENDER_API_KEY</code> и
-                    <code>RENDER_SERVICE_ID</code>.</div>
-                <input type="password" id="tokenRenderInput" placeholder="Токен (мин. 8 символов)"
-                    style="margin-top:10px;">
-                <div class="modal-actions">
+                <div class="hint">Записывает <code>LOGS_TOKEN</code> в env-переменные сервиса и запускает деплой (30–60
+                    сек). Требует env-переменные <code>RENDER_API_KEY</code> и <code>RENDER_SERVICE_ID</code>.</div>
+                <div class="gen-row">
+                    <input type="text" id="tokenRenderInput" placeholder="Токен">
+                    <button onclick="generateToken('tokenRenderInput')" title="Сгенерировать">🎲</button>
+                </div>
+                <div class="modal-actions" style="margin-top:10px;">
                     <button onclick="saveTokenViaRender()" id="btnSaveRender" class="primary">Установить через
                         Render</button>
                 </div>
@@ -495,11 +516,46 @@
         const metaOpenIds = new Set();
         let tokenStatus = { required: false, source: null, env_locked: false, render_api_available: false, can_set_local: false, can_delete_local: false };
 
+        // --- ASCII-only токен ---
+        function isAsciiToken(t) {
+            if (!t || t.length < 8) return false;
+            for (let i = 0; i < t.length; i++) {
+                const c = t.charCodeAt(i);
+                if (c < 0x21 || c > 0x7E) return false;
+            }
+            return true;
+        }
+
+        function generateToken(inputId) {
+            const t = Array.from(crypto.getRandomValues(new Uint8Array(24)))
+                .map(b => b.toString(16).padStart(2, '0')).join('');
+            document.getElementById(inputId).value = t;
+        }
+
+        // --- Чистим плохой токен из localStorage ДО первого запроса ---
+        (function sanitizeStoredToken() {
+            try {
+                const t = localStorage.getItem(TOKEN_KEY);
+                if (t && !isAsciiToken(t)) {
+                    localStorage.removeItem(TOKEN_KEY);
+                    setTimeout(() => {
+                        const el = document.getElementById('banner');
+                        if (el) {
+                            el.innerHTML = '<div class="banner error">⚠️ В localStorage был сохранён невалидный токен (не-ASCII). Он удалён. Установите новый через 🔑.</div>';
+                        }
+                    }, 100);
+                }
+            } catch (e) { }
+        })();
+
         function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
+
         function authHeaders() {
             const t = getToken();
-            return t ? { 'Authorization': 'Bearer ' + t } : {};
+            if (!isAsciiToken(t)) return {};
+            return { 'Authorization': 'Bearer ' + t };
         }
+
         function esc(s) {
             if (s === null || s === undefined) return '';
             return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -515,8 +571,6 @@
             if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
             return (n / 1024 / 1024).toFixed(1) + ' MB';
         }
-
-        // -------- СТАТУС ТОКЕНА --------
 
         async function loadTokenStatus() {
             try {
@@ -567,8 +621,6 @@
             renderBanner();
         }
 
-        // -------- МОДАЛ --------
-
         function openTokenModal() {
             const m = document.getElementById('tokenModal');
             const info = document.getElementById('tokenModalInfo');
@@ -580,11 +632,10 @@
             document.getElementById('renderProgress').style.display = 'none';
             document.getElementById('renderProgress').textContent = '';
 
-            // Информация сверху
             if (tokenStatus.source === 'env') {
-                info.innerHTML = 'Токен задан через <code>LOGS_TOKEN</code> в env-переменных. Локальная установка недоступна.' +
+                info.innerHTML = 'Токен задан через <code>LOGS_TOKEN</code> в env-переменных.' +
                     (tokenStatus.render_api_available
-                        ? ' Но вы можете переустановить его через Render API.'
+                        ? ' Его можно переустановить через Render API.'
                         : ' Менять можно только в Render Dashboard.');
             } else if (tokenStatus.can_set_local) {
                 info.innerHTML = 'Токен ещё не установлен. Выберите способ установки ниже.';
@@ -592,17 +643,14 @@
                 info.innerHTML = 'Токен уже установлен. Можно заменить или удалить.';
             }
 
-            // Локальная секция
             if (tokenStatus.can_set_local) {
                 sectionLocal.style.display = '';
-                const btnRemove = document.getElementById('btnRemoveLocal');
-                btnRemove.style.display = tokenStatus.can_delete_local ? '' : 'none';
+                document.getElementById('btnRemoveLocal').style.display = tokenStatus.can_delete_local ? '' : 'none';
                 document.getElementById('btnSaveLocal').textContent = tokenStatus.source === 'file' ? 'Заменить локальный' : 'Сохранить локально';
             } else {
                 sectionLocal.style.display = 'none';
             }
 
-            // Render API секция
             if (tokenStatus.render_api_available) {
                 sectionRender.style.display = '';
                 document.getElementById('btnSaveRender').textContent =
@@ -625,9 +673,8 @@
         }
 
         async function saveTokenLocal() {
-            const input = document.getElementById('tokenLocalInput');
-            const t = input.value.trim();
-            if (t.length < 8) { alert('Токен должен быть не короче 8 символов'); return; }
+            const t = document.getElementById('tokenLocalInput').value.trim();
+            if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII (латиница, цифры, - _ . ~). Кириллица и пробелы запрещены.'); return; }
             const r = await fetch('/_token', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -646,7 +693,7 @@
         }
 
         async function removeTokenLocal() {
-            if (!confirm('Удалить локальный токен? Логи снова станут доступны всем, пока не задан env-токен.')) return;
+            if (!confirm('Удалить локальный токен? Логи снова станут доступны всем.')) return;
             const r = await fetch('/_token', { method: 'DELETE', headers: authHeaders() });
             if (r.ok) {
                 closeTokenModal();
@@ -659,9 +706,8 @@
         }
 
         async function saveTokenViaRender() {
-            const input = document.getElementById('tokenRenderInput');
-            const t = input.value.trim();
-            if (t.length < 8) { alert('Токен должен быть не короче 8 символов'); return; }
+            const t = document.getElementById('tokenRenderInput').value.trim();
+            if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII.'); return; }
 
             const progress = document.getElementById('renderProgress');
             progress.style.display = 'block';
@@ -679,11 +725,8 @@
             if (r.ok) {
                 progress.style.color = '#86efac';
                 progress.textContent = '✅ ' + (data.message || 'Токен установлен. Сервис перезапускается.');
-
-                // Сразу сохраняем в localStorage — как только сервис перезапустится, эти креды будут валидны
                 localStorage.setItem(TOKEN_KEY, t);
                 document.getElementById('token').value = t;
-
                 setTimeout(() => {
                     closeTokenModal();
                     loadTokenStatus();
@@ -696,14 +739,12 @@
             }
         }
 
-        // -------- РУЧНОЙ ВВОД В ШАПКЕ --------
-
         function saveToken() {
-            localStorage.setItem(TOKEN_KEY, document.getElementById('token').value.trim());
+            const t = document.getElementById('token').value.trim();
+            if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII.'); return; }
+            localStorage.setItem(TOKEN_KEY, t);
             load();
         }
-
-        // -------- ЛОГИ --------
 
         async function load() {
             try {
@@ -802,8 +843,6 @@
             }).join('');
             main.innerHTML = html;
         }
-
-        // -------- ИНИЦИАЛИЗАЦИЯ --------
 
         document.getElementById('token').value = getToken();
 
