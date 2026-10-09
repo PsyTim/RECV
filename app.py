@@ -25,6 +25,9 @@ logging.basicConfig(
 )
 log = logging.getLogger("smsproxy")
 
+# Werkzeug access-log — в WARNING, чтобы не дублировал наши строки
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
+
 app = Flask(__name__)
 
 # --- токен логов ---
@@ -33,9 +36,9 @@ ENV_TOKEN = os.environ.get("LOGS_TOKEN", "").strip()
 RENDER_API_KEY = os.environ.get("RENDER_API_KEY", "").strip()
 RENDER_SERVICE_ID = os.environ.get("RENDER_SERVICE_ID", "").strip()
 
-# --- персистентность логов ---
+# --- БД ---
 DB_FILE = BASE_DIR / "logs.db"
-LOGS_FILE = BASE_DIR / "logs.json"
+LOGS_FILE = BASE_DIR / "logs.json"          # старый формат, для миграции
 
 # --- http-прокси ---
 PROXY_USER = os.environ.get("PROXY_USER", "").strip()
@@ -47,7 +50,7 @@ PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "30"))
 
 PROXY_ENABLED = bool(PROXY_USER and PROXY_PASS and UPSTREAM_PROXY_URL)
 
-# --- телефон и AID-счётчик ---
+# --- телефон и AID ---
 COUNTER_FILE = BASE_DIR / "counter.txt"
 AID_UNIT_SECONDS = float(os.environ.get("AID_UNIT_SECONDS", "180"))
 AID_RAND_MIN = int(os.environ.get("AID_RAND_MIN", "3"))
@@ -62,6 +65,22 @@ MAX_RESP_BYTES = int(os.environ.get("MAX_RESP_BYTES", "10240"))
 
 ALL_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD']
 RENDER_API = "https://api.render.com/v1"
+
+# Пути, которые не логируем в INFO (шум от UI-авторефреша)
+QUIET_PREFIXES = ('/_logs', '/_ui', '/health', '/_token', '/_phone', '/favicon.ico')
+
+# Шаблоны путей, характерные для сканеров уязвимостей
+SUSPICIOUS_PATTERNS = (
+    '/connect',
+    '/autodiscover', '/ecp', '/owa', '/mapi', '/rpc',
+    '/wp-admin', '/wp-login', '/wp-content', '/xmlrpc.php',
+    '/phpmyadmin', '/pma', '/mysql',
+    '/.env', '/.git', '/.aws', '/.ssh',
+    '/sourcedb/', '/cgi-bin/', '/scripts/',
+    '/admin', '/manager', '/console',
+    '/vendor/', '/config/',
+)
+SUSPICIOUS_SUFFIXES = ('.php', '.asp', '.aspx', '.jsp', '.cgi', '.env', '.git')
 
 
 # ==================== SQLITE ====================
@@ -112,7 +131,6 @@ def init_db():
         )
     """)
     _db_conn.execute("CREATE INDEX IF NOT EXISTS idx_logs_timestamp ON logs(timestamp)")
-    # Хранилище key-value: используется для хранения телефона (кросс-воркерное)
     _db_conn.execute("""
         CREATE TABLE IF NOT EXISTS kv (
             key TEXT PRIMARY KEY,
@@ -120,7 +138,16 @@ def init_db():
         )
     """)
     _db_conn.commit()
+
     log.info("DB initialised at %s", DB_FILE)
+    try:
+        cur = _db_conn.execute("SELECT COUNT(*) FROM logs")
+        log.info("DB: logs count = %d", cur.fetchone()[0])
+        cur = _db_conn.execute("SELECT key, value FROM kv")
+        kv_rows = [(r["key"], r["value"]) for r in cur.fetchall()]
+        log.info("DB: kv contents = %r", kv_rows)
+    except Exception as e:
+        log.warning("DB diagnostics failed: %s", e)
 
 
 def kv_get(key):
@@ -134,11 +161,13 @@ def kv_set(key, value):
     with db_lock:
         if value is None:
             _db_conn.execute("DELETE FROM kv WHERE key = ?", (key,))
+            log.info("KV SET: %s = <deleted>", key)
         else:
             _db_conn.execute(
                 "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)",
                 (key, str(value)),
             )
+            log.info("KV SET: %s = %r", key, str(value))
         _db_conn.commit()
 
 
@@ -406,6 +435,10 @@ def load_aid_counter():
 
 
 def next_aid():
+    """
+    incr = 1 + int((delta / 180) * Rand(3..7))
+    new_aid = aid + incr; файл перезаписываем (now, new_aid).
+    """
     with aid_lock:
         ts, aid = load_aid_counter()
         now = int(datetime.now(timezone.utc).timestamp())
@@ -539,6 +572,20 @@ def append_log(record):
     db_insert_log(record)
 
 
+def should_quiet_log(path):
+    return path.startswith(QUIET_PREFIXES)
+
+
+def is_suspicious(path):
+    """Грубый фильтр сканеров/ботов: 404 без записи в БД."""
+    p = path.lower()
+    if any(p.startswith(x) for x in SUSPICIOUS_PATTERNS):
+        return True
+    if any(p.endswith(x) for x in SUSPICIOUS_SUFFIXES):
+        return True
+    return False
+
+
 # ==================== UI ====================
 
 @app.route('/_ui', methods=['GET'])
@@ -639,7 +686,7 @@ def setup_render_token():
     })
 
 
-# ==================== ТЕЛЕФОН (в SQLite kv) ====================
+# ==================== ТЕЛЕФОН (SQLite kv) ====================
 
 PHONE_KV_KEY = "phone"
 
@@ -660,10 +707,9 @@ def consume_phone():
         if phone:
             _db_conn.execute("DELETE FROM kv WHERE key = ?", (PHONE_KV_KEY,))
             _db_conn.commit()
-    if phone:
-        log.info("PHONE consumed: %r", phone)
-    else:
-        log.info("PHONE consume requested, but empty")
+            log.info("PHONE consumed from kv: %r", phone)
+        else:
+            log.info("PHONE consume: kv empty")
     return phone
 
 
@@ -675,7 +721,7 @@ def phone_endpoint():
 
     if request.method == 'GET':
         phone = get_current_phone()
-        log.info("PHONE GET -> %r", phone)
+        log.debug("PHONE GET -> %r", phone)
         return jsonify({"phone": phone})
 
     if request.method == 'POST':
@@ -846,12 +892,23 @@ def handle_proxy():
     return Response(resp.content, resp.status_code, resp_headers)
 
 
-# ==================== ОБЫЧНЫЙ ЛОГГЕР (+ getNumber) ====================
+# ==================== ОБЫЧНЫЙ ЛОГГЕР + getNumber ====================
 
 def is_phone_getter_request(body_json):
-    if not isinstance(body_json, dict):
-        return False
-    actions = body_json.get("action")
+    """
+    Клиент передаёт action либо в JSON-теле, либо в query string.
+    Поддерживаем оба варианта.
+    """
+    actions = None
+
+    if isinstance(body_json, dict):
+        actions = body_json.get("action")
+
+    if actions is None:
+        q_actions = request.args.getlist("action")
+        if q_actions:
+            actions = q_actions
+
     if actions is None:
         return False
     if isinstance(actions, str):
@@ -866,7 +923,8 @@ def handle_log(path):
     cookies = {k: v for k, v in request.cookies.items()}
 
     if is_phone_getter_request(body_json):
-        log.info("GETNUMBER request from %s at %s", request.remote_addr, request.path)
+        log.info("GETNUMBER request from %s at %s",
+                 request.remote_addr, request.full_path.rstrip('?'))
         phone = consume_phone()
         if phone:
             aid = next_aid()
@@ -957,19 +1015,24 @@ def handle_log(path):
 @app.route('/', defaults={'path': ''}, methods=ALL_METHODS)
 @app.route('/<path:path>', methods=ALL_METHODS)
 def catch_all(path):
+    # Отсекаем сканеров — 404, без записи в БД
+    if is_suspicious(request.path):
+        log.warning("BLOCKED suspicious %s from %s", request.path, request.remote_addr)
+        return Response("Not Found", status=404)
+
     is_proxy = PROXY_ENABLED and is_proxy_request()
 
-    # Логируем все запросы, кроме служебных (/_ui, /_logs, /health — слишком шумные)
-    if not request.path.startswith(('/_logs', '/_ui', '/health', '/_token')):
+    if not should_quiet_log(request.path):
         log.info("REQ %s %s from %s proxy=%s",
-                 request.method, request.full_path.rstrip('?'), request.remote_addr, is_proxy)
+                 request.method, request.full_path.rstrip('?'),
+                 request.remote_addr, is_proxy)
 
     if is_proxy:
         return handle_proxy()
     return handle_log(path)
 
 
-# ==================== ГЛОБАЛЬНЫЙ ОБРАБОТЧИК ОШИБОК ====================
+# ==================== ОШИБКИ ====================
 
 @app.errorhandler(Exception)
 def handle_exception(e):
