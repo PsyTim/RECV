@@ -109,7 +109,6 @@
             user-select: none;
         }
 
-        /* -------- кнопка включения режима выделения (голый чекбокс) -------- */
         .mode-toggle {
             display: flex;
             align-items: center;
@@ -139,7 +138,6 @@
             background: #2563eb;
         }
 
-        /* -------- select-all чекбокс (виден только в режиме выделения) -------- */
         .chk-all-label {
             display: flex;
             align-items: center;
@@ -236,7 +234,14 @@
             box-shadow: 0 0 0 1px #2563eb inset;
         }
 
-        /* базовая сетка — без колонки чекбокса */
+        .log.proxy {
+            border-left: 3px solid #a855f7;
+        }
+
+        .log.err {
+            border-left: 3px solid #ef4444;
+        }
+
         .log-head {
             display: grid;
             grid-template-columns: 100px 70px 1fr 140px 70px 36px;
@@ -247,7 +252,6 @@
             font-size: 13px;
         }
 
-        /* в режиме выделения — с колонкой чекбокса */
         body.select-mode .log-head {
             grid-template-columns: 26px 100px 70px 1fr 140px 70px 36px;
         }
@@ -256,7 +260,6 @@
             background: #243449;
         }
 
-        /* строка-чекбокс: по умолчанию скрыт */
         .row-chk {
             display: none;
             width: 16px;
@@ -305,6 +308,55 @@
 
         .method.OPTIONS,
         .method.HEAD {
+            background: #334155;
+            color: #cbd5e1;
+        }
+
+        .proxy-tag {
+            display: inline-block;
+            font-size: 9px;
+            padding: 2px 5px;
+            border-radius: 3px;
+            background: #581c87;
+            color: #d8b4fe;
+            font-weight: 700;
+            margin-right: 6px;
+            letter-spacing: 0.5px;
+            vertical-align: middle;
+        }
+
+        .status-tag {
+            display: inline-block;
+            font-size: 10px;
+            padding: 2px 6px;
+            border-radius: 3px;
+            font-family: ui-monospace, monospace;
+            font-weight: 700;
+            margin-right: 6px;
+            vertical-align: middle;
+        }
+
+        .status-2xx {
+            background: #14532d;
+            color: #86efac;
+        }
+
+        .status-3xx {
+            background: #78350f;
+            color: #fdba74;
+        }
+
+        .status-4xx {
+            background: #7c2d12;
+            color: #fdba74;
+        }
+
+        .status-5xx {
+            background: #7f1d1d;
+            color: #fca5a5;
+        }
+
+        .status-none {
             background: #334155;
             color: #cbd5e1;
         }
@@ -368,6 +420,10 @@
             margin: 14px 0 6px;
             letter-spacing: 1px;
             font-weight: 600;
+        }
+
+        .log-body h3.resp-h {
+            color: #60a5fa;
         }
 
         pre {
@@ -536,16 +592,12 @@
         <span class="badge" id="tokenBadge">—</span>
         <div class="spacer"></div>
 
-        <!-- голый чекбокс: включает/выключает режим выделения -->
         <label class="mode-toggle" title="Режим выделения">
             <input type="checkbox" id="selectMode" onchange="setSelectMode(this.checked)">
         </label>
-
-        <!-- select-all: виден только в режиме выделения -->
         <label class="chk-all-label" id="selectAllWrap" title="Выбрать все" style="display:none">
             <input type="checkbox" id="selectAll" onchange="toggleSelectAll(this.checked)">
         </label>
-
         <button class="danger" id="bulkDeleteBtn" onclick="deleteSelected()" style="display:none">🗑 0</button>
 
         <label class="chk"><input type="checkbox" id="autorefresh" checked> авто</label>
@@ -565,7 +617,6 @@
     <div class="modal-backdrop" id="tokenModal" style="display:none">
         <div class="modal">
             <h2>🔑 Токен доступа</h2>
-
             <div class="modal-info" id="tokenModalInfo"></div>
 
             <div class="modal-section" id="sectionLocal">
@@ -610,10 +661,9 @@
         let logs = [];
         const openIds = new Set();
         const metaOpenIds = new Set();
+        const respMetaOpenIds = new Set();
         const selectedIds = new Set();
         let tokenStatus = { required: false, source: null, env_locked: false, render_api_available: false, can_set_local: false, can_delete_local: false };
-
-        // ---------- ТОКЕН: УТИЛИТЫ ----------
 
         function isAsciiToken(t) {
             if (!t || t.length < 8) return false;
@@ -623,13 +673,11 @@
             }
             return true;
         }
-
         function generateToken(inputId) {
             const t = Array.from(crypto.getRandomValues(new Uint8Array(24)))
                 .map(b => b.toString(16).padStart(2, '0')).join('');
             document.getElementById(inputId).value = t;
         }
-
         (function sanitizeStoredToken() {
             try {
                 const t = localStorage.getItem(TOKEN_KEY);
@@ -642,15 +690,12 @@
                 }
             } catch (e) { }
         })();
-
         function getToken() { return localStorage.getItem(TOKEN_KEY) || ''; }
-
         function authHeaders() {
             const t = getToken();
             if (!isAsciiToken(t)) return {};
             return { 'Authorization': 'Bearer ' + t };
         }
-
         function esc(s) {
             if (s === null || s === undefined) return '';
             return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -666,9 +711,16 @@
             if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
             return (n / 1024 / 1024).toFixed(1) + ' MB';
         }
+        function statusClass(code) {
+            if (!code) return 'status-none';
+            if (code >= 200 && code < 300) return 'status-2xx';
+            if (code >= 300 && code < 400) return 'status-3xx';
+            if (code >= 400 && code < 500) return 'status-4xx';
+            if (code >= 500) return 'status-5xx';
+            return 'status-none';
+        }
 
         // ---------- РЕЖИМ ВЫДЕЛЕНИЯ ----------
-
         function setSelectMode(on) {
             document.body.classList.toggle('select-mode', on);
             try { localStorage.setItem(SELECT_MODE_KEY, on ? '1' : '0'); } catch (e) { }
@@ -678,7 +730,6 @@
             updateSelectAllState();
             updateBulkButton();
         }
-
         function initSelectMode() {
             let on = false;
             try { on = localStorage.getItem(SELECT_MODE_KEY) === '1'; } catch (e) { }
@@ -688,7 +739,6 @@
             const wrap = document.getElementById('selectAllWrap');
             if (wrap) wrap.style.display = on ? '' : 'none';
         }
-
         function toggleSelect(id, checked, ev) {
             if (ev) ev.stopPropagation();
             if (checked) selectedIds.add(id); else selectedIds.delete(id);
@@ -697,17 +747,12 @@
             updateSelectAllState();
             updateBulkButton();
         }
-
         function toggleSelectAll(checked) {
-            if (checked) {
-                logs.forEach(l => selectedIds.add(l.id));
-            } else {
-                selectedIds.clear();
-            }
+            if (checked) logs.forEach(l => selectedIds.add(l.id));
+            else selectedIds.clear();
             render();
             updateBulkButton();
         }
-
         function updateSelectAllState() {
             const el = document.getElementById('selectAll');
             if (!el) return;
@@ -716,23 +761,14 @@
             el.checked = total > 0 && sel === total;
             el.indeterminate = sel > 0 && sel < total;
         }
-
         function updateBulkButton() {
             const btn = document.getElementById('bulkDeleteBtn');
             if (!btn) return;
-            if (!document.body.classList.contains('select-mode')) {
-                btn.style.display = 'none';
-                return;
-            }
+            if (!document.body.classList.contains('select-mode')) { btn.style.display = 'none'; return; }
             const n = selectedIds.size;
-            if (n === 0) {
-                btn.style.display = 'none';
-            } else {
-                btn.style.display = '';
-                btn.textContent = '🗑 ' + n;
-            }
+            if (n === 0) btn.style.display = 'none';
+            else { btn.style.display = ''; btn.textContent = '🗑 ' + n; }
         }
-
         async function deleteSelected() {
             const ids = Array.from(selectedIds);
             if (!ids.length) return;
@@ -742,17 +778,14 @@
                 headers: { 'Content-Type': 'application/json', ...authHeaders() },
                 body: JSON.stringify({ ids })
             });
-            if (r.ok) {
-                selectedIds.clear();
-                load();
-            } else {
+            if (r.ok) { selectedIds.clear(); load(); }
+            else {
                 const err = await r.json().catch(() => ({}));
                 alert('Ошибка: ' + (err.error || r.status));
             }
         }
 
         // ---------- СТАТУС ТОКЕНА ----------
-
         async function loadTokenStatus() {
             try {
                 const r = await fetch('/_token/status');
@@ -763,29 +796,17 @@
             updateTokenBadge();
             renderBanner();
         }
-
         function updateTokenBadge() {
             const b = document.getElementById('tokenBadge');
             if (!b) return;
-            if (!tokenStatus.required) {
-                b.textContent = '🔓 открыто';
-                b.style.background = '#7f1d1d'; b.style.color = '#fca5a5';
-            } else if (tokenStatus.source === 'env') {
-                b.textContent = '🔒 env';
-                b.style.background = '#14532d'; b.style.color = '#86efac';
-            } else {
-                b.textContent = '🔒 файл';
-                b.style.background = '#14532d'; b.style.color = '#86efac';
-            }
+            if (!tokenStatus.required) { b.textContent = '🔓 открыто'; b.style.background = '#7f1d1d'; b.style.color = '#fca5a5'; }
+            else if (tokenStatus.source === 'env') { b.textContent = '🔒 env'; b.style.background = '#14532d'; b.style.color = '#86efac'; }
+            else { b.textContent = '🔒 файл'; b.style.background = '#14532d'; b.style.color = '#86efac'; }
         }
-
         function renderBanner() {
             const el = document.getElementById('banner');
             if (!el) return;
-            if (tokenStatus.required || sessionStorage.getItem('token_banner_dismissed')) {
-                el.innerHTML = '';
-                return;
-            }
+            if (tokenStatus.required || sessionStorage.getItem('token_banner_dismissed')) { el.innerHTML = ''; return; }
             const renderHint = tokenStatus.render_api_available
                 ? ' Для постоянного хранения используйте установку через Render API.'
                 : ' Для постоянного хранения задайте RENDER_API_KEY и RENDER_SERVICE_ID в env-переменных.';
@@ -805,7 +826,6 @@
         }
 
         // ---------- МОДАЛ ----------
-
         function openTokenModal() {
             const m = document.getElementById('tokenModal');
             const info = document.getElementById('tokenModalInfo');
@@ -826,9 +846,7 @@
             if (info) {
                 if (tokenStatus.source === 'env') {
                     info.innerHTML = 'Токен задан через <code>LOGS_TOKEN</code> в env-переменных.' +
-                        (tokenStatus.render_api_available
-                            ? ' Его можно переустановить через Render API.'
-                            : ' Менять можно только в Render Dashboard.');
+                        (tokenStatus.render_api_available ? ' Его можно переустановить через Render API.' : ' Менять можно только в Render Dashboard.');
                 } else if (tokenStatus.can_set_local) {
                     info.innerHTML = 'Токен ещё не установлен. Выберите способ установки ниже.';
                 } else {
@@ -841,19 +859,13 @@
                     sectionLocal.style.display = '';
                     if (btnRemoveLocal) btnRemoveLocal.style.display = tokenStatus.can_delete_local ? '' : 'none';
                     if (btnSaveLocal) btnSaveLocal.textContent = tokenStatus.source === 'file' ? 'Заменить локальный' : 'Сохранить локально';
-                } else {
-                    sectionLocal.style.display = 'none';
-                }
+                } else sectionLocal.style.display = 'none';
             }
-
             if (sectionRender) {
                 if (tokenStatus.render_api_available) {
                     sectionRender.style.display = '';
-                    if (btnSaveRender) btnSaveRender.textContent =
-                        tokenStatus.source === 'env' ? 'Переустановить через Render' : 'Установить через Render';
-                } else {
-                    sectionRender.style.display = 'none';
-                }
+                    if (btnSaveRender) btnSaveRender.textContent = tokenStatus.source === 'env' ? 'Переустановить через Render' : 'Установить через Render';
+                } else sectionRender.style.display = 'none';
             }
 
             m.style.display = 'flex';
@@ -862,15 +874,13 @@
                 if (firstInput) firstInput.focus();
             }, 50);
         }
-
         function closeTokenModal() {
             const m = document.getElementById('tokenModal');
             if (m) m.style.display = 'none';
         }
-
         async function saveTokenLocal() {
             const t = document.getElementById('tokenLocalInput').value.trim();
-            if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII (латиница, цифры, - _ . ~).'); return; }
+            if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII.'); return; }
             const r = await fetch('/_token', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -887,54 +897,39 @@
                 alert('Ошибка: ' + (err.error || r.status));
             }
         }
-
         async function removeTokenLocal() {
             if (!confirm('Удалить локальный токен? Логи снова станут доступны всем.')) return;
             const r = await fetch('/_token', { method: 'DELETE', headers: authHeaders() });
-            if (r.ok) {
-                closeTokenModal();
-                await loadTokenStatus();
-                load();
-            } else {
+            if (r.ok) { closeTokenModal(); await loadTokenStatus(); load(); }
+            else {
                 const err = await r.json().catch(() => ({}));
                 alert('Ошибка: ' + (err.error || r.status));
             }
         }
-
         async function saveTokenViaRender() {
             const t = document.getElementById('tokenRenderInput').value.trim();
             if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII.'); return; }
-
             const progress = document.getElementById('renderProgress');
             progress.style.display = 'block';
             progress.style.color = '#fbbf24';
             progress.textContent = '⏳ Отправляю запрос к Render API…';
-
             const r = await fetch('/_setup_render_token', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...authHeaders() },
                 body: JSON.stringify({ token: t })
             });
-
             const data = await r.json().catch(() => ({}));
-
             if (r.ok) {
                 progress.style.color = '#86efac';
                 progress.textContent = '✅ ' + (data.message || 'Токен установлен.');
                 localStorage.setItem(TOKEN_KEY, t);
                 document.getElementById('token').value = t;
-                setTimeout(() => {
-                    closeTokenModal();
-                    loadTokenStatus();
-                    load();
-                }, 3000);
+                setTimeout(() => { closeTokenModal(); loadTokenStatus(); load(); }, 3000);
             } else {
                 progress.style.color = '#fca5a5';
-                progress.textContent = '❌ ' + (data.error || ('HTTP ' + r.status)) +
-                    (data.details ? ' — ' + data.details : '');
+                progress.textContent = '❌ ' + (data.error || ('HTTP ' + r.status)) + (data.details ? ' — ' + data.details : '');
             }
         }
-
         function saveToken() {
             const t = document.getElementById('token').value.trim();
             if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII.'); return; }
@@ -943,7 +938,6 @@
         }
 
         // ---------- ЛОГИ ----------
-
         async function load() {
             try {
                 const r = await fetch('/_logs', { headers: authHeaders() });
@@ -955,10 +949,8 @@
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 const data = await r.json();
                 logs = data.logs || [];
-
                 const live = new Set(logs.map(l => l.id));
                 Array.from(selectedIds).forEach(id => { if (!live.has(id)) selectedIds.delete(id); });
-
                 document.getElementById('status').textContent = `записей: ${data.count}`;
                 render();
                 updateSelectAllState();
@@ -967,31 +959,27 @@
                 document.getElementById('status').textContent = 'ошибка: ' + e.message;
             }
         }
-
         async function del(id, ev) {
             ev.stopPropagation();
             if (!confirm('Удалить эту запись?')) return;
             const r = await fetch('/_logs/' + id, { method: 'DELETE', headers: authHeaders() });
-            if (r.ok) {
-                openIds.delete(id); metaOpenIds.delete(id); selectedIds.delete(id);
-                load();
-            }
+            if (r.ok) { openIds.delete(id); metaOpenIds.delete(id); respMetaOpenIds.delete(id); selectedIds.delete(id); load(); }
         }
-
         async function clearAll() {
             if (!confirm('Удалить ВСЕ записи? Действие необратимо.')) return;
             const r = await fetch('/_logs/clear', { method: 'POST', headers: authHeaders() });
-            if (r.ok) { openIds.clear(); metaOpenIds.clear(); selectedIds.clear(); load(); }
+            if (r.ok) { openIds.clear(); metaOpenIds.clear(); respMetaOpenIds.clear(); selectedIds.clear(); load(); }
         }
-
         function toggle(id) {
             if (openIds.has(id)) openIds.delete(id); else openIds.add(id);
             const el = document.querySelector('.log[data-id="' + id + '"]');
             if (el) el.classList.toggle('open', openIds.has(id));
         }
-
         function toggleMeta(id, isOpen) {
             if (isOpen) metaOpenIds.add(id); else metaOpenIds.delete(id);
+        }
+        function toggleRespMeta(id, isOpen) {
+            if (isOpen) respMetaOpenIds.add(id); else respMetaOpenIds.delete(id);
         }
 
         function render() {
@@ -1004,7 +992,14 @@
             const html = logs.slice().reverse().map(log => {
                 const opened = openIds.has(log.id);
                 const metaOpened = metaOpenIds.has(log.id);
+                const respMetaOpened = respMetaOpenIds.has(log.id);
                 const selected = selectedIds.has(log.id);
+                const isProxy = !!log.proxy;
+                const hasError = !!log.error;
+
+                const displayUrl = isProxy && log.target_url ? log.target_url : (log.full_url || log.path);
+                const displayPath = isProxy && log.target_url ? log.target_url : log.path;
+
                 const preview = log.body_json ? JSON.stringify(log.body_json) : (log.body_text || '');
                 const shortPreview = preview.length > 60 ? preview.slice(0, 60) + '…' : preview;
 
@@ -1019,32 +1014,52 @@
                     method: log.method,
                     path: log.path,
                     full_url: log.full_url,
+                    target_url: log.target_url,
+                    proxy: log.proxy,
                     content_type: log.content_type,
                     body_size: log.body_size,
                     body_truncated: log.body_truncated,
                     body_encoding: log.body_encoding,
                 };
 
+                const hasResp = log.resp_status !== null && log.resp_status !== undefined;
+                const statusBadge = hasResp
+                    ? `<span class="status-tag ${statusClass(log.resp_status)}">${log.resp_status}</span>`
+                    : (hasError ? `<span class="status-tag status-5xx">ERR</span>` : '');
+
                 return `
-      <div class="log${opened ? ' open' : ''}${selected ? ' selected' : ''}" data-id="${esc(log.id)}">
+      <div class="log${opened ? ' open' : ''}${selected ? ' selected' : ''}${isProxy ? ' proxy' : ''}${hasError ? ' err' : ''}" data-id="${esc(log.id)}">
         <div class="log-head" onclick="toggle('${esc(log.id)}')">
           <input type="checkbox" class="row-chk" ${selected ? 'checked' : ''}
                  onclick="event.stopPropagation()"
                  onchange="toggleSelect('${esc(log.id)}', this.checked)">
           <span class="time">${esc(fmtTime(log.timestamp))}</span>
           <span class="method ${esc(log.method)}">${esc(log.method)}</span>
-          <span class="path" title="${esc(log.full_url || log.path)}">${esc(log.path)}${shortPreview ? ' <span style="color:#64748b">· ' + esc(shortPreview) + '</span>' : ''}</span>
+          <span class="path" title="${esc(displayUrl)}">${isProxy ? '<span class="proxy-tag">PROXY</span>' : ''}${statusBadge}${esc(displayPath)}${shortPreview ? ' <span style="color:#64748b">· ' + esc(shortPreview) + '</span>' : ''}</span>
           <span class="ip">${esc(log.remote_addr || '')}</span>
-          <span class="size">${esc(fmtBytes(log.body_size))}</span>
+          <span class="size">${esc(fmtBytes(log.body_size))}${log.resp_body_size ? ' → ' + esc(fmtBytes(log.resp_body_size)) : ''}</span>
           <button class="del-btn" onclick="del('${esc(log.id)}', event)" title="Удалить">✕</button>
         </div>
         <div class="log-body">
-          ${log.body_json ? `<h3>JSON body</h3><pre>${esc(JSON.stringify(log.body_json, null, 2))}</pre>` : ''}
-          ${!log.body_json && log.body_text ? `<h3>Body (${esc(log.body_encoding || 'raw')})</h3><pre>${esc(log.body_text)}${log.body_truncated ? '\n\n[…обрезано]' : ''}</pre>` : ''}
+          ${hasError ? `<h3 class="resp-h">⚠ Error</h3><pre>${esc(log.error)}</pre>` : ''}
+          ${isProxy ? `<h3>Target URL</h3><pre>${esc(log.target_url || '')}</pre>` : ''}
+
+          ${log.body_json ? `<h3>Request JSON body</h3><pre>${esc(JSON.stringify(log.body_json, null, 2))}</pre>` : ''}
+          ${!log.body_json && log.body_text ? `<h3>Request body (${esc(log.body_encoding || 'raw')})</h3><pre>${esc(log.body_text)}${log.body_truncated ? '\n\n[…обрезано]' : ''}</pre>` : ''}
           ${Object.keys(log.query_params || {}).length ? `<h3>Query params</h3><pre>${esc(JSON.stringify(log.query_params, null, 2))}</pre>` : ''}
           ${Object.keys(log.form || {}).length ? `<h3>Form</h3><pre>${esc(JSON.stringify(log.form, null, 2))}</pre>` : ''}
           ${Object.keys(log.cookies || {}).length ? `<h3>Cookies</h3><pre>${esc(JSON.stringify(log.cookies, null, 2))}</pre>` : ''}
-          ${Object.keys(headers).length ? `<h3>Headers</h3><pre>${esc(JSON.stringify(headers, null, 2))}</pre>` : ''}
+          ${Object.keys(headers).length ? `<h3>Request headers</h3><pre>${esc(JSON.stringify(headers, null, 2))}</pre>` : ''}
+
+          ${hasResp ? `<h3 class="resp-h">Response ${log.resp_status}${log.resp_reason ? ' ' + esc(log.resp_reason) : ''}</h3>` : ''}
+          ${log.resp_body_json ? `<h3 class="resp-h">Response JSON body</h3><pre>${esc(JSON.stringify(log.resp_body_json, null, 2))}</pre>` : ''}
+          ${!log.resp_body_json && log.resp_body_text ? `<h3 class="resp-h">Response body (${esc(log.resp_body_encoding || 'raw')})</h3><pre>${esc(log.resp_body_text)}${log.resp_body_truncated ? '\n\n[…обрезано]' : ''}</pre>` : ''}
+          ${log.resp_headers && Object.keys(log.resp_headers).length ? `
+            <details class="meta" ${respMetaOpened ? 'open' : ''} ontoggle="toggleRespMeta('${esc(log.id)}', this.open)">
+              <summary>Response headers</summary>
+              <pre>${esc(JSON.stringify(log.resp_headers, null, 2))}</pre>
+            </details>` : ''}
+
           <details class="meta" ${metaOpened ? 'open' : ''} ontoggle="toggleMeta('${esc(log.id)}', this.open)">
             <summary>Metadata</summary>
             <pre>${esc(JSON.stringify(meta, null, 2))}</pre>
@@ -1058,7 +1073,6 @@
         }
 
         // ---------- ИНИЦИАЛИЗАЦИЯ ----------
-
         document.getElementById('token').value = getToken();
         initSelectMode();
 
