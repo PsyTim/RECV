@@ -658,10 +658,7 @@ def _pipe(a, b):
 
 
 def _select_socks5_auth(client, methods, client_ip="?"):
-    """Согласовать метод аутентификации. Возвращает True или None.
-
-    Логируем username и длину пароля (сам пароль — нет).
-    """
+    """Согласовать метод аутентификации. Возвращает True или None."""
     if SOCKS_USER:
         if 0x02 not in methods:
             client.sendall(b"\x05\xff")
@@ -724,69 +721,100 @@ def _socks5_handle_client(client, addr):
         nmethods = hdr[1]
         methods = _recv_exact(client, nmethods)
         if methods is None:
+            log.debug("SOCKS5 %s: short read on methods", client_ip)
             return
 
         if _select_socks5_auth(client, methods, client_ip) is None:
             log.warning("SOCKS5 auth failed from %s", client_ip)
             return
 
+        log.info("SOCKS5 %s: auth OK, waiting for CONNECT request", client_ip)
+
         # --- request ---
-        rhdr = _recv_exact(client, 4)
-        if not rhdr:
+        try:
+            rhdr = _recv_exact(client, 4)
+        except socket.timeout:
+            log.warning("SOCKS5 %s: timeout while waiting for CONNECT after auth (peer did not send)", client_ip)
             return
+        except (ConnectionResetError, BrokenPipeError) as e:
+            log.info("SOCKS5 %s: peer reset connection after auth (%s)", client_ip, type(e).__name__)
+            return
+
+        if rhdr is None:
+            log.info("SOCKS5 %s: peer closed connection after auth WITHOUT sending CONNECT", client_ip)
+            return
+
+        log.info("SOCKS5 %s: request bytes = %s", client_ip, rhdr.hex())
         ver, cmd, rsv, atyp = rhdr
-        if ver != 0x05 or cmd != 0x01:      # только CONNECT
+
+        if ver != 0x05:
+            log.warning("SOCKS5 %s: bad VER in request: 0x%02x", client_ip, ver)
+            client.sendall(b"\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00")
+            return
+        if cmd != 0x01:
+            log.warning("SOCKS5 %s: unsupported CMD 0x%02x (only CONNECT=0x01 is supported)", client_ip, cmd)
             client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
             return
 
         if atyp == 0x01:                    # IPv4
             raw = _recv_exact(client, 4)
             if raw is None:
+                log.info("SOCKS5 %s: short read on IPv4 address", client_ip)
                 return
             host = socket.inet_ntoa(raw)
         elif atyp == 0x03:                  # domain
             ln_b = _recv_exact(client, 1)
             if ln_b is None:
+                log.info("SOCKS5 %s: short read on domain length", client_ip)
                 return
             ln = ln_b[0]
             raw = _recv_exact(client, ln)
             if raw is None:
+                log.info("SOCKS5 %s: short read on domain", client_ip)
                 return
             host = raw.decode('utf-8', 'replace')
         elif atyp == 0x04:                  # IPv6
             raw = _recv_exact(client, 16)
             if raw is None:
+                log.info("SOCKS5 %s: short read on IPv6 address", client_ip)
                 return
             host = socket.inet_ntop(socket.AF_INET6, raw)
         else:
+            log.warning("SOCKS5 %s: unsupported ATYP 0x%02x", client_ip, atyp)
             client.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
             return
 
         port_b = _recv_exact(client, 2)
         if port_b is None:
+            log.info("SOCKS5 %s: short read on port", client_ip)
             return
         port = struct.unpack("!H", port_b)[0]
+
+        log.info("SOCKS5 %s: CONNECT request to %s:%d, opening upstream tunnel...",
+                 client_ip, host, port)
 
         # --- open tunnel via upstream ---
         try:
             remote = _upstream_tunnel(host, port)
         except Exception as e:
-            log.warning("SOCKS5 CONNECT %s:%d from %s failed: %s",
-                        host, port, client_ip, e)
+            log.warning("SOCKS5 CONNECT %s:%d from %s failed: %s", host, port, client_ip, e)
             client.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
             return
 
         # success reply
         client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-        log.info("SOCKS5 CONNECT %s:%d from %s — tunnel established",
-                 host, port, client_ip)
+        log.info("SOCKS5 CONNECT %s:%d from %s — tunnel established", host, port, client_ip)
 
         client.settimeout(None)
         remote.settimeout(None)
         _pipe(client, remote)
 
+    except socket.timeout:
+        log.warning("SOCKS5 %s: socket timeout", client_ip)
+    except (ConnectionResetError, BrokenPipeError) as e:
+        log.info("SOCKS5 %s: connection error: %s", client_ip, type(e).__name__)
     except Exception as e:
-        log.debug("SOCKS5 client %s error: %s", client_ip, e)
+        log.warning("SOCKS5 client %s error: %s: %s", client_ip, type(e).__name__, e)
     finally:
         try:
             client.close()
