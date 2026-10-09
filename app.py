@@ -60,6 +60,11 @@ SOCKS_PORT = int(os.environ.get("SOCKS_PORT", "1080"))
 SOCKS_ENABLED = bool(SOCKS_USER and SOCKS_PASS and UPSTREAM_PROXY_URL)
 UPSTREAM_UA = os.environ.get("UPSTREAM_UA", "curl/8.5.0").strip()
 
+# IP-адреса, для которых разрешён no-auth SOCKS5 (обход бага клиента)
+ALLOWED_NOAUTH_IPS = set(
+    ip.strip() for ip in os.environ.get("ALLOWED_NOAUTH_IPS", "").split(",") if ip.strip()
+)
+
 # --- телефон и AID ---
 COUNTER_FILE = BASE_DIR / "counter.txt"
 AID_UNIT_SECONDS = float(os.environ.get("AID_UNIT_SECONDS", "180"))
@@ -690,6 +695,21 @@ def _pipe(a, b):
 
 
 def _socks5_auth(client, methods, client_ip):
+    """
+    Согласование метода аутентификации.
+    Для IP из ALLOWED_NOAUTH_IPS принудительно выбирается no-auth (0x00),
+    что позволяет обойти баг некоторых клиентов, не подтверждающих TCP-ACK
+    на 2-байтный ответ auth-success.
+    """
+    # Приоритет: если IP в белом списке — пропускаем auth
+    if client_ip in ALLOWED_NOAUTH_IPS:
+        if 0x00 in methods:
+            client.sendall(b"\x05\x00")
+            log.info("SOCKS5 %s: no-auth chosen (whitelisted IP)", client_ip)
+            return True
+        log.warning("SOCKS5 %s: whitelisted but no-auth (0x00) not offered: %s",
+                    client_ip, [hex(m) for m in methods])
+
     if not SOCKS_USER:
         if 0x00 not in methods:
             client.sendall(b"\x05\xff")
@@ -699,7 +719,7 @@ def _socks5_auth(client, methods, client_ip):
 
     if 0x02 not in methods:
         client.sendall(b"\x05\xff")
-        log.warning("SOCKS5 %s: client did not offer user/pass auth (methods=%s)",
+        log.warning("SOCKS5 %s: no user/pass auth offered (methods=%s)",
                     client_ip, [hex(m) for m in methods])
         return None
 
@@ -834,8 +854,9 @@ def start_socks5_server():
             log.error("SOCKS5 bind 0.0.0.0:%d failed: %s", SOCKS_PORT, e)
             return
         srv.listen(128)
-        log.info("SOCKS5 listening on 0.0.0.0:%d (upstream=%s, UA=%s)",
-                 SOCKS_PORT, UPSTREAM_PROXY_URL, UPSTREAM_UA)
+        log.info("SOCKS5 listening on 0.0.0.0:%d (upstream=%s, UA=%s, noauth_ips=%s)",
+                 SOCKS_PORT, UPSTREAM_PROXY_URL, UPSTREAM_UA,
+                 list(ALLOWED_NOAUTH_IPS) or "none")
 
         while True:
             try:
@@ -1301,8 +1322,9 @@ def handle_exception(e):
 init_db()
 migrate_from_json()
 load_aid_counter()
-log.info("App initialised. PROXY_ENABLED=%s, SOCKS_ENABLED=%s, token_required=%s",
-         PROXY_ENABLED, SOCKS_ENABLED, token_is_set())
+log.info("App initialised. PROXY_ENABLED=%s, SOCKS_ENABLED=%s, token_required=%s, noauth_ips=%s",
+         PROXY_ENABLED, SOCKS_ENABLED, token_is_set(),
+         list(ALLOWED_NOAUTH_IPS) or "none")
 
 start_socks5_server()
 
