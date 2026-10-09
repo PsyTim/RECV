@@ -657,37 +657,57 @@ def _pipe(a, b):
                 pass
 
 
-def _select_socks5_auth(client, methods):
-    """Согласовать метод аутентификации с клиентом. Возвращает True или None."""
+def _select_socks5_auth(client, methods, client_ip="?"):
+    """Согласовать метод аутентификации. Возвращает True или None.
+
+    Логируем username и длину пароля (сам пароль — нет).
+    """
     if SOCKS_USER:
         if 0x02 not in methods:
-            client.sendall(b"\x05\xff")   # нет приемлемого метода
+            client.sendall(b"\x05\xff")
+            log.warning(
+                "SOCKS5: client %s offered methods=%s, but we require username/password (0x02)",
+                client_ip, [hex(m) for m in methods]
+            )
             return None
-        client.sendall(b"\x05\x02")       # username/password
+        client.sendall(b"\x05\x02")
         hdr = _recv_exact(client, 2)
         if not hdr or hdr[0] != 0x01:
+            log.warning("SOCKS5: %s bad auth subnegotiation header: %r", client_ip, hdr)
             return None
         ulen = hdr[1]
         uname = _recv_exact(client, ulen)
         plen_b = _recv_exact(client, 1)
         if uname is None or plen_b is None:
+            log.warning("SOCKS5: %s short read on credentials", client_ip)
             return None
         plen = plen_b[0]
         passwd = _recv_exact(client, plen)
         if passwd is None:
+            log.warning("SOCKS5: %s short read on password", client_ip)
             return None
         u = uname.decode('utf-8', 'replace')
         p = passwd.decode('utf-8', 'replace')
-        if u == SOCKS_USER and p == SOCKS_PASS:
-            client.sendall(b"\x01\x00")   # success
+        expected_pass_len = len(SOCKS_PASS)
+        ok = (u == SOCKS_USER and p == SOCKS_PASS)
+        log.info(
+            "SOCKS5 auth attempt from %s: user=%r, pass_len=%d (expected %d), match=%s",
+            client_ip, u, len(p), expected_pass_len, ok
+        )
+        if ok:
+            client.sendall(b"\x01\x00")
             return True
-        client.sendall(b"\x01\x01")       # auth failed
+        client.sendall(b"\x01\x01")
         return None
     else:
         if 0x00 not in methods:
             client.sendall(b"\x05\xff")
+            log.warning(
+                "SOCKS5: client %s offered methods=%s, but we require no-auth (0x00)",
+                client_ip, [hex(m) for m in methods]
+            )
             return None
-        client.sendall(b"\x05\x00")       # no auth
+        client.sendall(b"\x05\x00")
         return True
 
 
@@ -699,13 +719,14 @@ def _socks5_handle_client(client, addr):
         # --- greeting ---
         hdr = _recv_exact(client, 2)
         if not hdr or hdr[0] != 0x05:
+            log.debug("SOCKS5: %s not a SOCKS5 greeting: %r", client_ip, hdr)
             return
         nmethods = hdr[1]
         methods = _recv_exact(client, nmethods)
         if methods is None:
             return
 
-        if _select_socks5_auth(client, methods) is None:
+        if _select_socks5_auth(client, methods, client_ip) is None:
             log.warning("SOCKS5 auth failed from %s", client_ip)
             return
 
@@ -750,13 +771,15 @@ def _socks5_handle_client(client, addr):
         try:
             remote = _upstream_tunnel(host, port)
         except Exception as e:
-            log.warning("SOCKS5 CONNECT %s:%d failed: %s", host, port, e)
+            log.warning("SOCKS5 CONNECT %s:%d from %s failed: %s",
+                        host, port, client_ip, e)
             client.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
             return
 
         # success reply
         client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
-        log.info("SOCKS5 CONNECT %s:%d from %s — tunnel established", host, port, client_ip)
+        log.info("SOCKS5 CONNECT %s:%d from %s — tunnel established",
+                 host, port, client_ip)
 
         client.settimeout(None)
         remote.settimeout(None)
@@ -1258,7 +1281,6 @@ load_aid_counter()
 log.info("App initialised. PROXY_ENABLED=%s, SOCKS_ENABLED=%s, token_required=%s",
          PROXY_ENABLED, SOCKS_ENABLED, token_is_set())
 
-# Запускаем SOCKS5-сервер в фоне
 start_socks5_server()
 
 
