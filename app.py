@@ -33,13 +33,12 @@ RENDER_API = "https://api.render.com/v1"
 # ------------------- ВАЛИДАЦИЯ ТОКЕНА -------------------
 
 def validate_token(t):
-    """Токен: 8+ символов, только печатные ASCII (0x21..0x7E)."""
     if not t or len(t) < 8:
         return False, "token too short (min 8 chars)"
     for ch in t:
         o = ord(ch)
         if o < 0x21 or o > 0x7E:
-            return False, "token must contain only printable ASCII characters (no spaces, no non-latin)"
+            return False, "token must contain only printable ASCII characters"
     return True, None
 
 
@@ -84,6 +83,11 @@ def check_token():
     if not active:
         return True
     return request.headers.get("Authorization", "") == f"Bearer {active}"
+
+
+def token_is_set():
+    active, _ = get_active_token()
+    return bool(active)
 
 
 def render_api_available():
@@ -166,8 +170,8 @@ def set_token_local():
     if ENV_TOKEN:
         return jsonify({"error": "token is set via env variable"}), 403
 
-    existing = load_file_token()
-    if existing and not check_token():
+    # Если токен уже установлен — требуем текущий
+    if token_is_set() and not check_token():
         return jsonify({"error": "unauthorized"}), 401
 
     save_file_token(new_token)
@@ -195,6 +199,10 @@ def setup_render_token():
         return jsonify({
             "error": "RENDER_API_KEY and RENDER_SERVICE_ID must be set as env variables on this service"
         }), 503
+
+    # Если токен уже установлен — только с правильной авторизацией
+    if token_is_set() and not check_token():
+        return jsonify({"error": "unauthorized"}), 401
 
     data = request.get_json(silent=True) or {}
     new_token = (data.get("token") or "").strip()
@@ -269,6 +277,26 @@ def clear_logs():
     with lock:
         logs.clear()
     return jsonify({"status": "cleared"})
+
+
+@app.route('/_logs/delete', methods=['POST'])
+def delete_batch():
+    """Батч-удаление по списку id."""
+    if not check_token():
+        return jsonify({"error": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    ids = data.get("ids")
+    if not isinstance(ids, list):
+        return jsonify({"error": "ids must be an array"}), 400
+
+    ids_set = set(ids)
+    with lock:
+        before = len(logs)
+        logs[:] = [r for r in logs if r.get("id") not in ids_set]
+        removed = before - len(logs)
+
+    return jsonify({"status": "deleted", "removed": removed, "requested": len(ids_set)})
 
 
 @app.route('/_logs/<log_id>', methods=['DELETE'])

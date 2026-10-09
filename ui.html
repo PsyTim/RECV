@@ -109,6 +109,58 @@
             user-select: none;
         }
 
+        /* -------- кнопка включения режима выделения (голый чекбокс) -------- */
+        .mode-toggle {
+            display: flex;
+            align-items: center;
+            padding: 4px 6px;
+            border-radius: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .mode-toggle:hover {
+            background: #243449;
+        }
+
+        .mode-toggle input {
+            width: 15px;
+            height: 15px;
+            accent-color: #2563eb;
+            cursor: pointer;
+            margin: 0;
+        }
+
+        body.select-mode .mode-toggle {
+            background: #1d4ed8;
+        }
+
+        body.select-mode .mode-toggle:hover {
+            background: #2563eb;
+        }
+
+        /* -------- select-all чекбокс (виден только в режиме выделения) -------- */
+        .chk-all-label {
+            display: flex;
+            align-items: center;
+            padding: 4px 6px;
+            border-radius: 6px;
+            cursor: pointer;
+            user-select: none;
+        }
+
+        .chk-all-label:hover {
+            background: #243449;
+        }
+
+        .chk-all-label input {
+            width: 15px;
+            height: 15px;
+            accent-color: #2563eb;
+            cursor: pointer;
+            margin: 0;
+        }
+
         #banner {
             padding: 0 20px;
             max-width: 1400px;
@@ -179,6 +231,12 @@
             border-color: #64748b;
         }
 
+        .log.selected {
+            border-color: #2563eb;
+            box-shadow: 0 0 0 1px #2563eb inset;
+        }
+
+        /* базовая сетка — без колонки чекбокса */
         .log-head {
             display: grid;
             grid-template-columns: 100px 70px 1fr 140px 70px 36px;
@@ -189,8 +247,26 @@
             font-size: 13px;
         }
 
+        /* в режиме выделения — с колонкой чекбокса */
+        body.select-mode .log-head {
+            grid-template-columns: 26px 100px 70px 1fr 140px 70px 36px;
+        }
+
         .log-head:hover {
             background: #243449;
+        }
+
+        /* строка-чекбокс: по умолчанию скрыт */
+        .row-chk {
+            display: none;
+            width: 16px;
+            height: 16px;
+            cursor: pointer;
+            accent-color: #2563eb;
+        }
+
+        body.select-mode .row-chk {
+            display: block;
         }
 
         .method {
@@ -436,7 +512,12 @@
 
         @media (max-width: 700px) {
             .log-head {
-                grid-template-columns: 70px 1fr 50px 30px;
+                grid-template-columns: 65px 55px 1fr 30px;
+                gap: 8px;
+            }
+
+            body.select-mode .log-head {
+                grid-template-columns: 24px 55px 50px 1fr 30px;
                 gap: 8px;
             }
 
@@ -454,18 +535,32 @@
         <span class="status" id="status">загрузка…</span>
         <span class="badge" id="tokenBadge">—</span>
         <div class="spacer"></div>
-        <label class="chk"><input type="checkbox" id="autorefresh" checked> авто-обновление</label>
+
+        <!-- голый чекбокс: включает/выключает режим выделения -->
+        <label class="mode-toggle" title="Режим выделения">
+            <input type="checkbox" id="selectMode" onchange="setSelectMode(this.checked)">
+        </label>
+
+        <!-- select-all: виден только в режиме выделения -->
+        <label class="chk-all-label" id="selectAllWrap" title="Выбрать все" style="display:none">
+            <input type="checkbox" id="selectAll" onchange="toggleSelectAll(this.checked)">
+        </label>
+
+        <button class="danger" id="bulkDeleteBtn" onclick="deleteSelected()" style="display:none">🗑 0</button>
+
+        <label class="chk"><input type="checkbox" id="autorefresh" checked> авто</label>
         <input type="password" id="token" placeholder="Токен для входа" style="width: 180px;">
         <button onclick="saveToken()">💾</button>
         <button onclick="load()">↻</button>
         <button onclick="openTokenModal()" title="Управление токеном">🔑</button>
-        <button class="danger" onclick="clearAll()">🗑 Все</button>
+        <button class="danger" onclick="clearAll()" title="Удалить все">🗑 Все</button>
     </header>
     <div id="banner"></div>
     <main id="main">
         <div class="empty">Загрузка…</div>
     </main>
-    <div class="footer">GET /_logs · DELETE /_logs/&lt;id&gt; · POST /_logs/clear · клавиша R — обновить</div>
+    <div class="footer">GET /_logs · DELETE /_logs/&lt;id&gt; · POST /_logs/delete · POST /_logs/clear · клавиша R —
+        обновить</div>
 
     <div class="modal-backdrop" id="tokenModal" style="display:none">
         <div class="modal">
@@ -511,10 +606,14 @@
 
     <script>
         const TOKEN_KEY = 'smsproxy_token';
+        const SELECT_MODE_KEY = 'smsproxy_select_mode';
         let logs = [];
         const openIds = new Set();
         const metaOpenIds = new Set();
+        const selectedIds = new Set();
         let tokenStatus = { required: false, source: null, env_locked: false, render_api_available: false, can_set_local: false, can_delete_local: false };
+
+        // ---------- ТОКЕН: УТИЛИТЫ ----------
 
         function isAsciiToken(t) {
             if (!t || t.length < 8) return false;
@@ -538,9 +637,7 @@
                     localStorage.removeItem(TOKEN_KEY);
                     setTimeout(() => {
                         const el = document.getElementById('banner');
-                        if (el) {
-                            el.innerHTML = '<div class="banner error">⚠️ В localStorage был сохранён невалидный токен (не-ASCII). Он удалён. Установите новый через 🔑.</div>';
-                        }
+                        if (el) el.innerHTML = '<div class="banner error">⚠️ В localStorage был сохранён невалидный токен (не-ASCII). Он удалён. Установите новый через 🔑.</div>';
                     }, 100);
                 }
             } catch (e) { }
@@ -569,6 +666,92 @@
             if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
             return (n / 1024 / 1024).toFixed(1) + ' MB';
         }
+
+        // ---------- РЕЖИМ ВЫДЕЛЕНИЯ ----------
+
+        function setSelectMode(on) {
+            document.body.classList.toggle('select-mode', on);
+            try { localStorage.setItem(SELECT_MODE_KEY, on ? '1' : '0'); } catch (e) { }
+            const wrap = document.getElementById('selectAllWrap');
+            if (wrap) wrap.style.display = on ? '' : 'none';
+            if (!on) selectedIds.clear();
+            updateSelectAllState();
+            updateBulkButton();
+        }
+
+        function initSelectMode() {
+            let on = false;
+            try { on = localStorage.getItem(SELECT_MODE_KEY) === '1'; } catch (e) { }
+            const cb = document.getElementById('selectMode');
+            if (cb) cb.checked = on;
+            document.body.classList.toggle('select-mode', on);
+            const wrap = document.getElementById('selectAllWrap');
+            if (wrap) wrap.style.display = on ? '' : 'none';
+        }
+
+        function toggleSelect(id, checked, ev) {
+            if (ev) ev.stopPropagation();
+            if (checked) selectedIds.add(id); else selectedIds.delete(id);
+            const el = document.querySelector('.log[data-id="' + id + '"]');
+            if (el) el.classList.toggle('selected', checked);
+            updateSelectAllState();
+            updateBulkButton();
+        }
+
+        function toggleSelectAll(checked) {
+            if (checked) {
+                logs.forEach(l => selectedIds.add(l.id));
+            } else {
+                selectedIds.clear();
+            }
+            render();
+            updateBulkButton();
+        }
+
+        function updateSelectAllState() {
+            const el = document.getElementById('selectAll');
+            if (!el) return;
+            const total = logs.length;
+            const sel = logs.filter(l => selectedIds.has(l.id)).length;
+            el.checked = total > 0 && sel === total;
+            el.indeterminate = sel > 0 && sel < total;
+        }
+
+        function updateBulkButton() {
+            const btn = document.getElementById('bulkDeleteBtn');
+            if (!btn) return;
+            if (!document.body.classList.contains('select-mode')) {
+                btn.style.display = 'none';
+                return;
+            }
+            const n = selectedIds.size;
+            if (n === 0) {
+                btn.style.display = 'none';
+            } else {
+                btn.style.display = '';
+                btn.textContent = '🗑 ' + n;
+            }
+        }
+
+        async function deleteSelected() {
+            const ids = Array.from(selectedIds);
+            if (!ids.length) return;
+            if (!confirm(`Удалить ${ids.length} ${ids.length === 1 ? 'запись' : 'записей'}?`)) return;
+            const r = await fetch('/_logs/delete', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json', ...authHeaders() },
+                body: JSON.stringify({ ids })
+            });
+            if (r.ok) {
+                selectedIds.clear();
+                load();
+            } else {
+                const err = await r.json().catch(() => ({}));
+                alert('Ошибка: ' + (err.error || r.status));
+            }
+        }
+
+        // ---------- СТАТУС ТОКЕНА ----------
 
         async function loadTokenStatus() {
             try {
@@ -620,6 +803,8 @@
             sessionStorage.setItem('token_banner_dismissed', '1');
             renderBanner();
         }
+
+        // ---------- МОДАЛ ----------
 
         function openTokenModal() {
             const m = document.getElementById('tokenModal');
@@ -685,7 +870,7 @@
 
         async function saveTokenLocal() {
             const t = document.getElementById('tokenLocalInput').value.trim();
-            if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII (латиница, цифры, - _ . ~). Кириллица и пробелы запрещены.'); return; }
+            if (!isAsciiToken(t)) { alert('Токен: 8+ символов, только печатные ASCII (латиница, цифры, - _ . ~).'); return; }
             const r = await fetch('/_token', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json', ...authHeaders() },
@@ -735,7 +920,7 @@
 
             if (r.ok) {
                 progress.style.color = '#86efac';
-                progress.textContent = '✅ ' + (data.message || 'Токен установлен. Сервис перезапускается.');
+                progress.textContent = '✅ ' + (data.message || 'Токен установлен.');
                 localStorage.setItem(TOKEN_KEY, t);
                 document.getElementById('token').value = t;
                 setTimeout(() => {
@@ -757,6 +942,8 @@
             load();
         }
 
+        // ---------- ЛОГИ ----------
+
         async function load() {
             try {
                 const r = await fetch('/_logs', { headers: authHeaders() });
@@ -768,8 +955,14 @@
                 if (!r.ok) throw new Error('HTTP ' + r.status);
                 const data = await r.json();
                 logs = data.logs || [];
+
+                const live = new Set(logs.map(l => l.id));
+                Array.from(selectedIds).forEach(id => { if (!live.has(id)) selectedIds.delete(id); });
+
                 document.getElementById('status').textContent = `записей: ${data.count}`;
                 render();
+                updateSelectAllState();
+                updateBulkButton();
             } catch (e) {
                 document.getElementById('status').textContent = 'ошибка: ' + e.message;
             }
@@ -779,13 +972,16 @@
             ev.stopPropagation();
             if (!confirm('Удалить эту запись?')) return;
             const r = await fetch('/_logs/' + id, { method: 'DELETE', headers: authHeaders() });
-            if (r.ok) { openIds.delete(id); metaOpenIds.delete(id); load(); }
+            if (r.ok) {
+                openIds.delete(id); metaOpenIds.delete(id); selectedIds.delete(id);
+                load();
+            }
         }
 
         async function clearAll() {
             if (!confirm('Удалить ВСЕ записи? Действие необратимо.')) return;
             const r = await fetch('/_logs/clear', { method: 'POST', headers: authHeaders() });
-            if (r.ok) { openIds.clear(); metaOpenIds.clear(); load(); }
+            if (r.ok) { openIds.clear(); metaOpenIds.clear(); selectedIds.clear(); load(); }
         }
 
         function toggle(id) {
@@ -802,11 +998,13 @@
             const main = document.getElementById('main');
             if (!logs.length) {
                 main.innerHTML = '<div class="empty">Пока нет записей. Отправьте любой запрос на этот сервер.</div>';
+                updateSelectAllState();
                 return;
             }
             const html = logs.slice().reverse().map(log => {
                 const opened = openIds.has(log.id);
                 const metaOpened = metaOpenIds.has(log.id);
+                const selected = selectedIds.has(log.id);
                 const preview = log.body_json ? JSON.stringify(log.body_json) : (log.body_text || '');
                 const shortPreview = preview.length > 60 ? preview.slice(0, 60) + '…' : preview;
 
@@ -828,8 +1026,11 @@
                 };
 
                 return `
-      <div class="log${opened ? ' open' : ''}" data-id="${esc(log.id)}">
+      <div class="log${opened ? ' open' : ''}${selected ? ' selected' : ''}" data-id="${esc(log.id)}">
         <div class="log-head" onclick="toggle('${esc(log.id)}')">
+          <input type="checkbox" class="row-chk" ${selected ? 'checked' : ''}
+                 onclick="event.stopPropagation()"
+                 onchange="toggleSelect('${esc(log.id)}', this.checked)">
           <span class="time">${esc(fmtTime(log.timestamp))}</span>
           <span class="method ${esc(log.method)}">${esc(log.method)}</span>
           <span class="path" title="${esc(log.full_url || log.path)}">${esc(log.path)}${shortPreview ? ' <span style="color:#64748b">· ' + esc(shortPreview) + '</span>' : ''}</span>
@@ -853,9 +1054,13 @@
     `;
             }).join('');
             main.innerHTML = html;
+            updateSelectAllState();
         }
 
+        // ---------- ИНИЦИАЛИЗАЦИЯ ----------
+
         document.getElementById('token').value = getToken();
+        initSelectMode();
 
         (async () => {
             await loadTokenStatus();
