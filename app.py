@@ -1,6 +1,9 @@
 import os
 import json
 import base64
+import struct
+import socket
+import select
 import threading
 import uuid
 import random
@@ -9,6 +12,7 @@ import logging
 import requests
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 from flask import Flask, request, jsonify, Response
 
@@ -49,6 +53,12 @@ PROXY_TIMEOUT = int(os.environ.get("PROXY_TIMEOUT", "30"))
 
 PROXY_ENABLED = bool(PROXY_USER and PROXY_PASS and UPSTREAM_PROXY_URL)
 
+# --- SOCKS5 ---
+SOCKS_USER = os.environ.get("SOCKS_USER", "").strip()
+SOCKS_PASS = os.environ.get("SOCKS_PASS", "").strip()
+SOCKS_PORT = int(os.environ.get("SOCKS_PORT", "1080"))
+SOCKS_ENABLED = bool(SOCKS_USER and SOCKS_PASS and UPSTREAM_PROXY_URL)
+
 # --- телефон и AID ---
 COUNTER_FILE = BASE_DIR / "counter.txt"
 AID_UNIT_SECONDS = float(os.environ.get("AID_UNIT_SECONDS", "180"))
@@ -57,7 +67,6 @@ AID_RAND_MAX = int(os.environ.get("AID_RAND_MAX", "7"))
 
 aid_lock = threading.Lock()
 
-# --- лимиты ---
 MAX_LOGS = int(os.environ.get("MAX_LOGS", "1000"))
 MAX_BODY_BYTES = int(os.environ.get("MAX_BODY_BYTES", "10240"))
 MAX_RESP_BYTES = int(os.environ.get("MAX_RESP_BYTES", "10240"))
@@ -578,6 +587,220 @@ def is_suspicious(path):
     return False
 
 
+# ==================== SOCKS5 SERVER ====================
+
+def _recv_exact(sock, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def _upstream_tunnel(host, port):
+    """Открыть raw TCP-туннель к host:port через upstream HTTP-прокси (CONNECT)."""
+    up = urlparse(UPSTREAM_PROXY_URL)
+    up_host = up.hostname
+    up_port = up.port or 80
+    s = socket.create_connection((up_host, up_port), timeout=15)
+
+    req = f"CONNECT {host}:{port} HTTP/1.1\r\nHost: {host}:{port}\r\n"
+    if UPSTREAM_PROXY_USER:
+        creds = base64.b64encode(
+            f"{UPSTREAM_PROXY_USER}:{UPSTREAM_PROXY_PASS}".encode('utf-8')
+        ).decode('ascii')
+        req += f"Proxy-Authorization: Basic {creds}\r\n"
+    req += "Proxy-Connection: Keep-Alive\r\n\r\n"
+    s.sendall(req.encode('utf-8'))
+
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = s.recv(4096)
+        if not chunk:
+            s.close()
+            raise IOError("upstream closed during CONNECT")
+        resp += chunk
+        if len(resp) > 16384:
+            s.close()
+            raise IOError("upstream CONNECT response too large")
+
+    first_line = resp.split(b"\r\n", 1)[0].decode('latin-1', 'replace')
+    if " 200 " not in first_line and not first_line.startswith("HTTP/1.1 200") \
+            and not first_line.startswith("HTTP/1.0 200"):
+        s.close()
+        raise IOError(f"upstream CONNECT failed: {first_line}")
+    return s
+
+
+def _pipe(a, b):
+    """Двунаправленная перекачка байтов между двумя сокетами."""
+    try:
+        while True:
+            r, _, _ = select.select([a, b], [], [], 300)
+            if not r:
+                break
+            for s in r:
+                other = b if s is a else a
+                data = s.recv(65536)
+                if not data:
+                    return
+                other.sendall(data)
+    except Exception:
+        pass
+    finally:
+        for s in (a, b):
+            try:
+                s.close()
+            except Exception:
+                pass
+
+
+def _select_socks5_auth(client, methods):
+    """Согласовать метод аутентификации с клиентом. Возвращает True или None."""
+    if SOCKS_USER:
+        if 0x02 not in methods:
+            client.sendall(b"\x05\xff")   # нет приемлемого метода
+            return None
+        client.sendall(b"\x05\x02")       # username/password
+        hdr = _recv_exact(client, 2)
+        if not hdr or hdr[0] != 0x01:
+            return None
+        ulen = hdr[1]
+        uname = _recv_exact(client, ulen)
+        plen_b = _recv_exact(client, 1)
+        if uname is None or plen_b is None:
+            return None
+        plen = plen_b[0]
+        passwd = _recv_exact(client, plen)
+        if passwd is None:
+            return None
+        u = uname.decode('utf-8', 'replace')
+        p = passwd.decode('utf-8', 'replace')
+        if u == SOCKS_USER and p == SOCKS_PASS:
+            client.sendall(b"\x01\x00")   # success
+            return True
+        client.sendall(b"\x01\x01")       # auth failed
+        return None
+    else:
+        if 0x00 not in methods:
+            client.sendall(b"\x05\xff")
+            return None
+        client.sendall(b"\x05\x00")       # no auth
+        return True
+
+
+def _socks5_handle_client(client, addr):
+    client_ip = addr[0] if addr else "?"
+    try:
+        client.settimeout(30)
+
+        # --- greeting ---
+        hdr = _recv_exact(client, 2)
+        if not hdr or hdr[0] != 0x05:
+            return
+        nmethods = hdr[1]
+        methods = _recv_exact(client, nmethods)
+        if methods is None:
+            return
+
+        if _select_socks5_auth(client, methods) is None:
+            log.warning("SOCKS5 auth failed from %s", client_ip)
+            return
+
+        # --- request ---
+        rhdr = _recv_exact(client, 4)
+        if not rhdr:
+            return
+        ver, cmd, rsv, atyp = rhdr
+        if ver != 0x05 or cmd != 0x01:      # только CONNECT
+            client.sendall(b"\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00")
+            return
+
+        if atyp == 0x01:                    # IPv4
+            raw = _recv_exact(client, 4)
+            if raw is None:
+                return
+            host = socket.inet_ntoa(raw)
+        elif atyp == 0x03:                  # domain
+            ln_b = _recv_exact(client, 1)
+            if ln_b is None:
+                return
+            ln = ln_b[0]
+            raw = _recv_exact(client, ln)
+            if raw is None:
+                return
+            host = raw.decode('utf-8', 'replace')
+        elif atyp == 0x04:                  # IPv6
+            raw = _recv_exact(client, 16)
+            if raw is None:
+                return
+            host = socket.inet_ntop(socket.AF_INET6, raw)
+        else:
+            client.sendall(b"\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00")
+            return
+
+        port_b = _recv_exact(client, 2)
+        if port_b is None:
+            return
+        port = struct.unpack("!H", port_b)[0]
+
+        # --- open tunnel via upstream ---
+        try:
+            remote = _upstream_tunnel(host, port)
+        except Exception as e:
+            log.warning("SOCKS5 CONNECT %s:%d failed: %s", host, port, e)
+            client.sendall(b"\x05\x05\x00\x01\x00\x00\x00\x00\x00\x00")
+            return
+
+        # success reply
+        client.sendall(b"\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00")
+        log.info("SOCKS5 CONNECT %s:%d from %s — tunnel established", host, port, client_ip)
+
+        client.settimeout(None)
+        remote.settimeout(None)
+        _pipe(client, remote)
+
+    except Exception as e:
+        log.debug("SOCKS5 client %s error: %s", client_ip, e)
+    finally:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
+def start_socks5_server():
+    if not SOCKS_ENABLED:
+        log.info("SOCKS5 disabled (need SOCKS_USER, SOCKS_PASS, UPSTREAM_PROXY_URL)")
+        return
+
+    def loop():
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("0.0.0.0", SOCKS_PORT))
+        except Exception as e:
+            log.error("SOCKS5 bind 0.0.0.0:%d failed: %s", SOCKS_PORT, e)
+            return
+        srv.listen(64)
+        log.info("SOCKS5 listening on 0.0.0.0:%d (upstream=%s)", SOCKS_PORT, UPSTREAM_PROXY_URL)
+
+        while True:
+            try:
+                client, addr = srv.accept()
+                threading.Thread(
+                    target=_socks5_handle_client,
+                    args=(client, addr),
+                    daemon=True,
+                ).start()
+            except Exception as e:
+                log.error("SOCKS5 accept error: %s", e)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
 # ==================== UI ====================
 
 @app.route('/_ui', methods=['GET'])
@@ -777,7 +1000,7 @@ def delete_log(log_id):
     return jsonify({"error": "not found"}), 404
 
 
-# ==================== ПРОКСИ ====================
+# ==================== HTTP ПРОКСИ ====================
 
 def handle_proxy():
     if not check_proxy_auth():
@@ -1032,8 +1255,11 @@ def handle_exception(e):
 init_db()
 migrate_from_json()
 load_aid_counter()
-log.info("App initialised. PROXY_ENABLED=%s, token_required=%s",
-         PROXY_ENABLED, token_is_set())
+log.info("App initialised. PROXY_ENABLED=%s, SOCKS_ENABLED=%s, token_required=%s",
+         PROXY_ENABLED, SOCKS_ENABLED, token_is_set())
+
+# Запускаем SOCKS5-сервер в фоне
+start_socks5_server()
 
 
 if __name__ == '__main__':
